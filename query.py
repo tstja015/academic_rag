@@ -17,6 +17,11 @@ logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# terminal colours
+class C:
+    ANSWER = "\033[96m"   # cyan
+    RESET  = "\033[0m"
+
 # ---------------------------------------------------------------------------
 # startup
 # ---------------------------------------------------------------------------
@@ -230,7 +235,7 @@ def ask(query, embedder, collection,
         folder_filter=folder_filter
     )
 
-    web_results  = []
+    web_results   = []
     search_engine = "none"
     use_web = force_web or getattr(config, "WEB_SEARCH_ENABLED", False)
 
@@ -249,14 +254,14 @@ def ask(query, embedder, collection,
         print("\n  [model refused context -- retrying as general question]")
         answer = ask_llm_general(query)
         print("\n=== ANSWER ===")
-        print("[Not found in papers or web -- answering from general knowledge]")
-        print(answer)
+        print(C.ANSWER + "[Not found in papers or web -- answering from general knowledge]" + C.RESET)
+        print(C.ANSWER + answer + C.RESET)
         print("\n=== SOURCES ===")
         print("  (none -- answered from general knowledge)")
         return answer
 
     print("\n=== ANSWER ===")
-    print(answer)
+    print(C.ANSWER + answer + C.RESET)
 
     print("\n=== SOURCES ===")
     print("  -- Papers --")
