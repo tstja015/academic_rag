@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# project runtime data -- not committed
+db/
+papers/
+
+# conda / venv
+.env
+env/
+venv/
+
+# aws credentials -- never commit these
+.aws/
+
+# os
+.DS_Store
+Thumbs.db

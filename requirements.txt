@@ -1,0 +1,6 @@
+pymupdf4llm
+chromadb
+sentence-transformers
+boto3
+tqdm
+httpx
