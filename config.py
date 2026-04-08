@@ -1,5 +1,12 @@
 PAPER_DIRS = [
     "./papers",
+    "/home/ans000/doc/CEED",
+    "/home/ans000/doc/New_Projects",
+    "/home/ans000/doc/MeOH_ADH",
+    "/home/ans000/doc/MeOH_FalDH",
+    "/home/ans000/doc/MeOH_FDH",
+    "/home/ans000/doc/papers",
+
     # "/path/to/more/papers",
     # "/mnt/nas/research",
 ]
