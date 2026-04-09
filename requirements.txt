@@ -1,6 +1,16 @@
+# Core RAG
 pymupdf4llm
 chromadb
 sentence-transformers
+torch
+# AWS
 boto3
+# NLP utilities
+nltk
+# Progress / display
 tqdm
 httpx
+# Web search (both are optional -- system falls back gracefully)
+duckduckgo-search
+tavily-python
+
