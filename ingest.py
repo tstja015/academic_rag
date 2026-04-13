@@ -1,420 +1,557 @@
+# ingest.py
 """
-ingest.py -- Index academic PDFs into ChromaDB.
-Improvements over original:
-  - allenai-specter embeddings (trained on scientific paper citations)
-  - Sentence-boundary-aware chunking via NLTK (no mid-sentence splits)
-  - Robust section header detection: markdown / bold / ALL-CAPS / numbered
-  - Contextual chunk prefix: paper title + section prepended to every chunk
-  - Rich metadata: year, title, arxiv ID, topic folder
-  - Expanded skip-section list (references, acknowledgements, appendix, etc.)
-  - Hash-based deduplication: already-indexed files are skipped instantly
+Ingest academic PDFs into ChromaDB with:
+  - Resume capability (skips already-ingested files via SHA-256 hash)
+  - Rename/move detection (updates metadata in place -- no re-embedding)
+  - Idempotent re-ingestion (removes stale chunks before inserting)
+  - Orphan cleanup (removes chunks whose source PDFs no longer exist)
+  - Per-file error isolation (one bad PDF won't kill the run)
+  - Section detection for chunk metadata
+  - OneDrive eviction after each successful ingest (WSL-aware)
+  - Periodic disk space reporting
 """
 
 import os
+import re
 import sys
 import json
 import hashlib
-import re
-
-import nltk
-import pymupdf4llm
-import chromadb
-from sentence_transformers import SentenceTransformer
+import logging
+from pathlib import Path
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fitz  # PyMuPDF
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+
 import config
+from onedrive_utils import free_onedrive_file, log_drive_free_space
+
+# -- logging ----------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# NLTK bootstrap
+# Progress tracking
 # ---------------------------------------------------------------------------
 
-def _ensure_nltk():
-    """Download the punkt sentence tokeniser once, then use the cache."""
-    for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
-        try:
-            nltk.data.find(resource)
-            return
-        except LookupError:
-            pass
-    print("  Downloading NLTK punkt tokeniser (one-time setup)...")
-    nltk.download("punkt",     quiet=True)
-    nltk.download("punkt_tab", quiet=True)
+def load_progress() -> dict:
+    pf = getattr(config, "PROGRESS_FILE", "./db/ingest_progress.json")
+    if os.path.exists(pf):
+        with open(pf) as f:
+            return json.load(f)
+    return {"completed": [], "failed": {}}
+
+
+def save_progress(progress: dict):
+    pf = getattr(config, "PROGRESS_FILE", "./db/ingest_progress.json")
+    os.makedirs(os.path.dirname(pf), exist_ok=True)
+    with open(pf, "w") as f:
+        json.dump(progress, f, indent=2)
+
+
+def file_hash(path: str) -> str:
+    """SHA-256 of file bytes -- stable document ID regardless of filename."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# File utilities
+# PDF collection
 # ---------------------------------------------------------------------------
 
-def get_file_hash(filepath: str) -> str:
-    """MD5 hash of a file -- used for deduplication."""
-    with open(filepath, "rb") as f:
-        return hashlib.md5(f.read()).hexdigest()
-
-
-def find_all_pdfs(paper_dirs: list) -> list:
-    """Recursively find every PDF under each directory in *paper_dirs*."""
+def collect_pdfs() -> list:
     pdfs = []
-    for base_dir in paper_dirs:
-        if not os.path.exists(base_dir):
-            print("  Warning: directory not found, skipping: {}".format(base_dir))
+    for d in config.PAPER_DIRS:
+        if not os.path.isdir(d):
+            log.warning("Directory not found, skipping: %s", d)
             continue
-        for root, _dirs, filenames in os.walk(base_dir, followlinks=True):
-            for fname in filenames:
-                if fname.lower().endswith(".pdf"):
-                    pdfs.append(os.path.join(root, fname))
-    print("Found {} PDF{} across {} director{}.".format(
-        len(pdfs),       "" if len(pdfs) == 1       else "s",
-        len(paper_dirs), "y" if len(paper_dirs) == 1 else "ies",
-    ))
-    return pdfs
+        for root, _, files in os.walk(d):
+            for fn in files:
+                if fn.lower().endswith(".pdf"):
+                    pdfs.append(os.path.join(root, fn))
+    unique = sorted(set(pdfs))
+    log.info("Found %d unique PDFs across %d directories",
+             len(unique), len(config.PAPER_DIRS))
+    return unique
 
 
 # ---------------------------------------------------------------------------
-# Metadata extraction
+# Text extraction
 # ---------------------------------------------------------------------------
 
-def extract_paper_metadata(filepath: str, md_text: str) -> dict:
-    """
-    Extract structured metadata from the filepath and converted markdown.
-    Every field has a safe fallback so a bad PDF never crashes the ingest.
-    """
-    filename = os.path.basename(filepath)
-    stem     = filename.replace(".pdf", "")
-
-    # Year -- matches "Smith2023", "2023-Smith", "arxiv_2301.12345" etc.
-    year_m = re.search(r"(19|20)\d{2}", filename)
-    year   = year_m.group(0) if year_m else "unknown"
-
-    # ArXiv ID -- "2305.12345" or "2305.12345v2"
-    arxiv_m  = re.search(r"\b(\d{4}\.\d{4,5})(v\d+)?\b", filename)
-    arxiv_id = arxiv_m.group(1) if arxiv_m else ""
-
-    # Title from the first top-level markdown heading in the document
-    title_m = re.search(r"^#\s+(.+)", md_text, re.MULTILINE)
-    title   = title_m.group(1).strip() if title_m else stem
-    title   = title[:200]   # ChromaDB metadata values must be short strings
-
-    # Topic folder = immediate parent directory name
-    # e.g. "/home/user/doc/MeOH_ADH/paper.pdf" -> "MeOH_ADH"
-    folder_name = os.path.basename(os.path.dirname(filepath))
-
-    return {
-        "filename":  filename,
-        "name":      stem,
-        "title":     title,
-        "year":      year,
-        "arxiv_id":  arxiv_id,
-        "full_path": filepath,
-        "folder":    folder_name,
-    }
+def extract_text(path: str) -> str:
+    """Extract text from PDF using PyMuPDF. Raises on corrupt files."""
+    doc = fitz.open(path)
+    pages = []
+    for page in doc:
+        pages.append(page.get_text("text"))
+    doc.close()
+    text = "\n".join(pages)
+    if not text.strip():
+        raise ValueError("No extractable text found (scanned PDF?)")
+    return text
 
 
 # ---------------------------------------------------------------------------
-# Section parsing
+# Section detection
 # ---------------------------------------------------------------------------
 
-# Sections that carry no scientific content worth indexing
-_SKIP_SECTIONS = frozenset({
-    "references", "bibliography",
-    "acknowledgements", "acknowledgments",
-    "funding", "funding sources",
-    "conflict of interest", "conflicts of interest",
-    "declaration of competing interest",
-    "author contributions", "author information",
-    "supplementary material", "supplementary information",
-    "appendix", "supporting information",
-    "data availability", "code availability",
-})
-
-# Header detection patterns tried in order.
-# Each must have exactly one capture group for the heading text.
-_HEADER_PATTERNS = [
-    re.compile(r"^#{1,4}\s+(.+)"),                             # ## 3.1 Methods
-    re.compile(r"^\*\*([A-Z][^*]{2,80})\*\*\s*$"),             # **Results**
-    re.compile(r"^([A-Z][A-Z\s\-]{3,60})\s*$"),                # RESULTS AND DISCUSSION
-    re.compile(r"^\d+\.?\d*\.?\s+([A-Z][a-zA-Z\s]{2,60})$"),   # 3.1 Experimental Setup
+_SECTION_PATTERNS = [
+    (r'\b(abstract)\b',                             'abstract'),
+    (r'\b(introduction)\b',                         'introduction'),
+    (r'\b(background)\b',                           'background'),
+    (r'\b(related\s+work)\b',                       'related work'),
+    (r'\b(literature\s+review)\b',                  'literature review'),
+    (r'\b(materials?\s+and\s+methods?)\b',          'materials and methods'),
+    (r'\b(methods?|methodology)\b',                 'methods'),
+    (r'\b(experimental\s+setup)\b',                 'experimental setup'),
+    (r'\b(experiments?)\b',                         'experiments'),
+    (r'\b(results?\s+and\s+discussion)\b',          'results and discussion'),
+    (r'\b(results?)\b',                             'results'),
+    (r'\b(findings)\b',                             'findings'),
+    (r'\b(discussion)\b',                           'discussion'),
+    (r'\b(conclusion|conclusions|concluding)\b',    'conclusions'),
+    (r'\b(summary)\b',                              'summary'),
+    (r'\b(acknowledg[e]?ments?)\b',                 'acknowledgements'),
+    (r'\b(references|bibliography)\b',              'references'),
+    (r'\b(appendix|supplementary)\b',               'appendix'),
 ]
 
 
-def _clean_section_name(raw: str) -> str:
-    cleaned = re.sub(r"[*_#\d.]", "", raw)
-    return cleaned.strip().lower()
-
-
-def _should_skip(section_name: str) -> bool:
-    return any(skip in section_name for skip in _SKIP_SECTIONS)
-
-
-def parse_sections(markdown_text: str) -> dict:
-    """
-    Return an ordered dict of {section_name: section_text}.
-    Text that appears before the first detected header is stored as 'abstract'.
-    If a section name repeats (e.g. two subsections both clean to 'results'),
-    their text is concatenated rather than overwriting.
-    """
-    sections: dict      = {}
-    current_section     = "abstract"
-    current_lines: list = []
-
-    for line in markdown_text.split("\n"):
-        matched = False
-        for pattern in _HEADER_PATTERNS:
-            m = pattern.match(line)
-            if m:
-                body = "\n".join(current_lines).strip()
-                if body:
-                    existing = sections.get(current_section, "")
-                    sections[current_section] = (existing + "\n" + body).strip()
-                current_section = _clean_section_name(m.group(1))
-                current_lines   = []
-                matched         = True
-                break
-        if not matched:
-            current_lines.append(line)
-
-    # Flush the last section
-    body = "\n".join(current_lines).strip()
-    if body:
-        existing = sections.get(current_section, "")
-        sections[current_section] = (existing + "\n" + body).strip()
-
-    return sections
+def detect_section(text: str) -> str:
+    head = text[:200].lower()
+    for pattern, label in _SECTION_PATTERNS:
+        if re.search(pattern, head, re.IGNORECASE):
+            return label
+    return "body"
 
 
 # ---------------------------------------------------------------------------
-# Sentence-boundary-aware chunking
+# Folder extraction
 # ---------------------------------------------------------------------------
 
-def chunk_text(
-    text: str,
-    chunk_size: int = config.CHUNK_SIZE,
-    overlap: int    = config.CHUNK_OVERLAP,
-) -> list:
-    """
-    Split *text* into overlapping chunks that respect sentence boundaries.
+def extract_folder(path: str) -> str:
+    abs_path = os.path.abspath(path)
+    for base_dir in config.PAPER_DIRS:
+        abs_base = os.path.abspath(base_dir)
+        if abs_path.startswith(abs_base + os.sep):
+            relative = os.path.relpath(abs_path, abs_base)
+            parts = Path(relative).parts
+            if len(parts) > 1:
+                return parts[0]
+            return Path(abs_base).name
+    return Path(path).parent.name
 
-    Algorithm:
-      1. Tokenise into sentences with NLTK.
-      2. Accumulate sentences until adding the next one would exceed chunk_size.
-      3. On flush, seed the next chunk with the last *overlap* words to preserve
-         cross-boundary context.
 
-    Falls back to splitting on '. ' if NLTK fails (e.g. corrupt text).
-    """
-    try:
-        sentences = nltk.sent_tokenize(text)
-    except Exception:
-        sentences = re.split(r"(?<=[.!?])\s+", text)
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
 
-    if not sentences:
-        return []
+def chunk_text(text: str) -> list:
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks      = []
+    current     = []
+    current_len = 0
 
-    chunks: list        = []
-    current_words: list = []
+    for sent in sentences:
+        words = sent.split()
+        if current_len + len(words) > config.CHUNK_SIZE and current:
+            chunks.append(" ".join(current))
+            overlap_words = " ".join(current).split()[-config.CHUNK_OVERLAP:]
+            current     = overlap_words + words
+            current_len = len(current)
+        else:
+            current.extend(words)
+            current_len += len(words)
 
-    for sentence in sentences:
-        s_words = sentence.split()
-        if not s_words:
-            continue
-
-        # If this sentence alone is longer than chunk_size, split it by words
-        # (handles tables, long equations, etc.)
-        if len(s_words) > chunk_size:
-            # Flush what we have first
-            if current_words:
-                chunks.append(" ".join(current_words))
-                current_words = current_words[-overlap:] if overlap else []
-            # Then emit the oversized sentence in word-level chunks
-            for start in range(0, len(s_words), chunk_size - overlap):
-                piece = " ".join(s_words[start : start + chunk_size])
-                if piece.strip():
-                    chunks.append(piece)
-            current_words = s_words[-overlap:] if overlap else []
-            continue
-
-        # Normal case: flush if adding this sentence would exceed chunk_size
-        if current_words and len(current_words) + len(s_words) > chunk_size:
-            chunks.append(" ".join(current_words))
-            current_words = current_words[-overlap:] if overlap else []
-
-        current_words.extend(s_words)
-
-    # Flush remainder
-    if current_words:
-        chunk = " ".join(current_words)
-        if chunk.strip():
-            chunks.append(chunk)
+    if current:
+        chunks.append(" ".join(current))
 
     return chunks
 
 
 # ---------------------------------------------------------------------------
-# Contextual chunk prefix
+# Rename / move detection and metadata update
 # ---------------------------------------------------------------------------
 
-def build_contextual_chunk(
-    chunk: str,
-    title: str,
-    section: str,
-    chunk_index: int,
-    total_chunks: int,
-) -> str:
+def check_and_update_metadata(fhash: str, current_path: str,
+                               collection) -> str:
     """
-    Prepend paper title and section name to every chunk.
+    Check whether stored metadata matches the current file path.
 
-    Why this matters for retrieval:
-      When a chunk is read in isolation by the vector search, it has no idea
-      which paper or section it came from.  Prepending this context means the
-      embedding encodes both the content *and* its document-level identity,
-      which significantly improves retrieval precision.
+    Returns:
+      "match"   -- everything is current, skip
+      "updated" -- metadata was stale and has been updated in place
+      "missing" -- no chunks found for this hash, needs full ingest
+      "error"   -- could not check (old schema), treat as skip
     """
-    if total_chunks > 1:
-        if chunk_index == 0:
-            position = " (beginning of section)"
-        elif chunk_index == total_chunks - 1:
-            position = " (end of section)"
-        else:
-            position = " (part {}/{})".format(chunk_index + 1, total_chunks)
-    else:
-        position = ""
+    current_filename = Path(current_path).name
+    current_abspath  = os.path.abspath(current_path)
+    current_folder   = extract_folder(current_path)
 
-    prefix = "Paper: {}\nSection: {}{}\n\n".format(title, section, position)
-    return prefix + chunk
+    try:
+        existing = collection.get(
+            where={"file_hash": {"$eq": fhash}},
+            include=["metadatas"],
+        )
+    except Exception:
+        return "error"
+
+    if not existing["ids"]:
+        log.info("No chunks found for hash %s... -- will ingest %s",
+                 fhash[:12], current_filename)
+        return "missing"
+
+    stored_meta     = existing["metadatas"][0]
+    stored_filename = stored_meta.get("filename", "")
+    stored_path     = stored_meta.get("full_path", "")
+
+    if stored_filename == current_filename and stored_path == current_abspath:
+        return "match"
+
+    if stored_filename != current_filename:
+        log.info("Rename detected: '%s' -> '%s'  (updating metadata)",
+                 stored_filename, current_filename)
+    elif stored_path != current_abspath:
+        log.info("Move detected: '%s' -> '%s'  (updating metadata)",
+                 stored_path, current_abspath)
+
+    updated_metas = []
+    for meta in existing["metadatas"]:
+        meta["filename"]  = current_filename
+        meta["full_path"] = current_abspath
+        meta["folder"]    = current_folder
+        updated_metas.append(meta)
+
+    collection.update(
+        ids       = existing["ids"],
+        metadatas = updated_metas,
+    )
+
+    log.info("  Updated metadata on %d chunks.", len(existing["ids"]))
+    return "updated"
 
 
 # ---------------------------------------------------------------------------
-# Main ingest routine
+# Single-file ingest
 # ---------------------------------------------------------------------------
 
-def ingest_papers():
-    _ensure_nltk()
+def ingest_one(path: str, collection, embed_model, fhash: str):
+    """Extract, chunk, embed, and store one PDF. Idempotent."""
 
-    print("Loading embedding model: {}".format(config.EMBED_MODEL))
-    embedder = SentenceTransformer(config.EMBED_MODEL)
+    # -- Remove any existing chunks for this file hash ----------------------
+    try:
+        existing = collection.get(
+            where={"file_hash": {"$eq": fhash}},
+            include=[],
+        )
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
+            log.info("  Removed %d stale chunks (hash %s...)",
+                     len(existing["ids"]), fhash[:12])
+    except Exception:
+        pass
 
-    chroma_client = chromadb.PersistentClient(path=config.DB_DIR)
-    collection    = chroma_client.get_or_create_collection(
+    # -- Extract and chunk --------------------------------------------------
+    text   = extract_text(path)
+    chunks = chunk_text(text)
+
+    if not chunks:
+        raise ValueError("Chunking produced no output")
+
+    filename = Path(path).name
+    folder   = extract_folder(path)
+
+    # -- Compute stats for logging ------------------------------------------
+    word_count    = len(text.split())
+    char_count    = len(text)
+    page_count    = fitz.open(path).page_count
+    file_size_mb  = os.path.getsize(path) / (1024 * 1024)
+    avg_chunk_len = sum(len(c.split()) for c in chunks) / len(chunks)
+
+    # -- Embed and store ----------------------------------------------------
+    batch_size = 32
+    for i in range(0, len(chunks), batch_size):
+        batch      = chunks[i:i + batch_size]
+        embeddings = embed_model.encode(batch, show_progress_bar=False).tolist()
+
+        ids       = [f"{fhash}_{i + j}" for j in range(len(batch))]
+        metadatas = [
+            {
+                "filename":     filename,
+                "full_path":    os.path.abspath(path),
+                "folder":       folder,
+                "section":      detect_section(batch[j]),
+                "chunk_index":  i + j,
+                "total_chunks": len(chunks),
+                "file_hash":    fhash,
+            }
+            for j in range(len(batch))
+        ]
+
+        collection.add(
+            ids        = ids,
+            documents  = batch,
+            embeddings = embeddings,
+            metadatas  = metadatas,
+        )
+
+    # -- Section breakdown --------------------------------------------------
+    section_counts = {}
+    for c in chunks:
+        sec = detect_section(c)
+        section_counts[sec] = section_counts.get(sec, 0) + 1
+
+    section_summary = ", ".join(f"{s}:{n}" for s, n in sorted(section_counts.items()))
+
+    log.info(
+        "Ingested %-50s  |  chunks: %3d  |  pages: %3d  |  words: %6d  |  "
+        "chars: %7d  |  size: %.2f MB  |  avg chunk: %3d words  |  "
+        "folder: %s  |  sections: {%s}",
+        filename,
+        len(chunks),
+        page_count,
+        word_count,
+        char_count,
+        file_size_mb,
+        int(avg_chunk_len),
+        folder,
+        section_summary,
+    )
+
+# ---------------------------------------------------------------------------
+# Orphan cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
+    """
+    Remove chunks from ChromaDB whose file_hash no longer corresponds to
+    any PDF on disk.  Also cleans the progress file.
+    """
+    log.info("Scanning for orphaned chunks...")
+
+    batch_size    = 10_000
+    offset        = 0
+    stored_hashes = {}  # hash -> {"filename": ..., "count": ...}
+
+    total = collection.count()
+    if total == 0:
+        log.info("  Collection is empty -- nothing to clean.")
+        return 0
+
+    while offset < total:
+        batch = collection.get(
+            limit   = batch_size,
+            offset  = offset,
+            include = ["metadatas"],
+        )
+        for meta in batch["metadatas"]:
+            fh = meta.get("file_hash", "")
+            if fh:
+                if fh not in stored_hashes:
+                    stored_hashes[fh] = {
+                        "filename": meta.get("filename", "?"),
+                        "count":    0,
+                    }
+                stored_hashes[fh]["count"] += 1
+        offset += batch_size
+
+    if not stored_hashes:
+        log.info("  No file_hash metadata found -- skipping cleanup.")
+        log.info("  (Old-schema chunks cannot be cleaned automatically.  "
+                 "Run: rm -rf ./db && python ingest.py)")
+        return 0
+
+    orphan_hashes = set(stored_hashes.keys()) - live_hashes
+
+    if not orphan_hashes:
+        log.info("  No orphaned chunks found.  Database is clean.")
+        return 0
+
+    log.info("  Found %d orphaned file hash(es):", len(orphan_hashes))
+    for oh in sorted(orphan_hashes):
+        info = stored_hashes[oh]
+        log.info("    %s...  %s  (%d chunks)",
+                 oh[:12], info["filename"], info["count"])
+
+    total_removed = 0
+    for oh in orphan_hashes:
+        try:
+            existing = collection.get(
+                where   = {"file_hash": {"$eq": oh}},
+                include = [],
+            )
+            if existing["ids"]:
+                collection.delete(ids=existing["ids"])
+                total_removed += len(existing["ids"])
+                log.info("    Deleted %d chunks for hash %s...",
+                         len(existing["ids"]), oh[:12])
+        except Exception as e:
+            log.warning("    Failed to delete chunks for hash %s...: %s",
+                        oh[:12], e)
+
+    # -- Clean progress file ------------------------------------------------
+    before_count = len(progress["completed"])
+    progress["completed"] = [
+        h for h in progress["completed"] if h not in orphan_hashes
+    ]
+    removed_from_progress = before_count - len(progress["completed"])
+
+    if "failed" in progress:
+        old_failed = dict(progress["failed"])
+        progress["failed"] = {
+            p: err for p, err in old_failed.items()
+            if os.path.exists(p)
+        }
+        removed_failed = len(old_failed) - len(progress["failed"])
+        if removed_failed:
+            log.info("  Removed %d stale entries from failed list.",
+                     removed_failed)
+
+    if removed_from_progress:
+        log.info("  Removed %d stale entries from progress file.",
+                 removed_from_progress)
+
+    save_progress(progress)
+    log.info("  Cleanup complete: %d orphaned chunks removed.", total_removed)
+    return total_removed
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    # -- ChromaDB -----------------------------------------------------------
+    os.makedirs(config.DB_DIR, exist_ok=True)
+    client = chromadb.PersistentClient(
+        path     = config.DB_DIR,
+        settings = Settings(anonymized_telemetry=False),
+    )
+    collection = client.get_or_create_collection(
         name     = config.COLLECTION_NAME,
         metadata = {"hnsw:space": "cosine"},
     )
+    log.info("Collection '%s' has %d existing chunks",
+             config.COLLECTION_NAME, collection.count())
 
-    # Load previously indexed file hashes
-    os.makedirs(config.DB_DIR, exist_ok=True)
-    hash_file = os.path.join(config.DB_DIR, "indexed.json")
-    if os.path.exists(hash_file):
-        with open(hash_file) as f:
-            indexed_hashes: set = set(json.load(f))
-    else:
-        indexed_hashes = set()
+    # -- embedding model ----------------------------------------------------
+    log.info("Loading embedding model: %s", config.EMBED_MODEL)
+    embed_model = SentenceTransformer(config.EMBED_MODEL)
 
-    os.makedirs("./papers", exist_ok=True)
-    pdfs = find_all_pdfs(config.PAPER_DIRS)
+    # -- collect files ------------------------------------------------------
+    all_pdfs = collect_pdfs()
+    if not all_pdfs:
+        log.error("No PDFs found. Check PAPER_DIRS in config.py")
+        sys.exit(1)
 
-    if not pdfs:
-        print("No PDFs found.  Add folder paths to PAPER_DIRS in config.py.")
-        return
+    # -- load resume state --------------------------------------------------
+    progress      = load_progress()
+    completed_set = set(progress["completed"])
+    log.info("Already completed: %d files", len(completed_set))
 
-    new_hashes: set = set()
-    skipped         = 0
-    processed       = 0
-    errors          = 0
+    # -- report starting disk space -----------------------------------------
+    log_drive_free_space("C")
 
-    for filepath in tqdm(pdfs, desc="Ingesting papers"):
-        file_hash = get_file_hash(filepath)
+    # -- main ingest loop ---------------------------------------------------
+    stats = {
+        "ingested":       0,
+        "skipped":        0,
+        "metadata_fixed": 0,
+        "failed":         0,
+        "freed_mb":       0.0,
+    }
 
-        if file_hash in indexed_hashes:
-            new_hashes.add(file_hash)
-            skipped += 1
+    live_hashes = set()  # built during loop, used by orphan cleanup
+
+    for i, pdf_path in enumerate(tqdm(all_pdfs, desc="Ingesting papers")):
+
+        # -- hash the file --------------------------------------------------
+        try:
+            fhash = file_hash(pdf_path)
+        except OSError as e:
+            log.warning("Cannot read %s: %s", pdf_path, e)
+            stats["failed"] += 1
             continue
 
-        try:
-            md_text   = pymupdf4llm.to_markdown(filepath)
-            base_meta = extract_paper_metadata(filepath, md_text)
-            sections  = parse_sections(md_text)
+        live_hashes.add(fhash)
 
-            chunks_to_add:   list = []
-            ids_to_add:      list = []
-            metadata_to_add: list = []
+        # -- already ingested: check for rename/move ------------------------
+        if fhash in completed_set:
+            status = check_and_update_metadata(fhash, pdf_path, collection)
 
-            for section_name, section_text in sections.items():
-                if _should_skip(section_name):
-                    continue
-                if len(section_text.strip()) < 80:   # skip stub sections
-                    continue
-
-                raw_chunks = chunk_text(section_text)
-                total      = len(raw_chunks)
-
-                for i, raw_chunk in enumerate(raw_chunks):
-                    contextual = build_contextual_chunk(
-                        chunk        = raw_chunk,
-                        title        = base_meta["title"],
-                        section      = section_name,
-                        chunk_index  = i,
-                        total_chunks = total,
-                    )
-
-                    # Zero-padded index keeps IDs sortable
-                    chunk_id = "{}_{}_{:04d}".format(file_hash, section_name, i)
-
-                    metadata = {
-                        "filename":     base_meta["filename"],
-                        "name":         base_meta["name"],
-                        "title":        base_meta["title"],
-                        "year":         base_meta["year"],
-                        "arxiv_id":     base_meta["arxiv_id"],
-                        "full_path":    base_meta["full_path"],
-                        "folder":       base_meta["folder"],
-                        "section":      section_name,
-                        "chunk_index":  i,
-                        "total_chunks": total,
-                        "file_hash":    file_hash,
-                    }
-
-                    chunks_to_add.append(contextual)
-                    ids_to_add.append(chunk_id)
-                    metadata_to_add.append(metadata)
-
-            if not chunks_to_add:
-                tqdm.write("  Warning: no usable content in {}".format(
-                    base_meta["filename"]
-                ))
-                new_hashes.add(file_hash)
-                processed += 1
+            if status == "match" or status == "error":
+                log.debug("Already ingested, skipping: %s",
+                          Path(pdf_path).name)
+                stats["skipped"] += 1
+                free_onedrive_file(pdf_path)
                 continue
 
-            embeddings = embedder.encode(
-                chunks_to_add,
-                show_progress_bar = False,
-                batch_size        = 32,
-            ).tolist()
+            elif status == "updated":
+                stats["metadata_fixed"] += 1
+                free_onedrive_file(pdf_path)
+                continue
 
-            collection.add(
-                documents  = chunks_to_add,
-                embeddings = embeddings,
-                ids        = ids_to_add,
-                metadatas  = metadata_to_add,
-            )
+            # status == "missing" -- fall through to full ingest
 
-            new_hashes.add(file_hash)
-            processed += 1
+        # -- skip known bad files -------------------------------------------
+        if pdf_path in progress.get("failed", {}):
+            log.debug("Previously failed, skipping: %s",
+                      Path(pdf_path).name)
+            stats["skipped"] += 1
+            free_onedrive_file(pdf_path)
+            continue
 
-        except Exception as exc:
-            tqdm.write("  Error processing {}: {}".format(filepath, exc))
-            errors += 1
+        # -- process --------------------------------------------------------
+        try:
+            ingest_one(pdf_path, collection, embed_model, fhash)
 
-    # Persist the updated set of indexed hashes
-    with open(hash_file, "w") as f:
-        json.dump(list(indexed_hashes | new_hashes), f)
+            if fhash not in completed_set:
+                progress["completed"].append(fhash)
+                completed_set.add(fhash)
+            save_progress(progress)
+            stats["ingested"] += 1
 
-    print("\n--- Ingest complete ---")
-    print("  Processed  : {}".format(processed))
-    print("  Skipped    : {} (already indexed)".format(skipped))
-    print("  Errors     : {}".format(errors))
-    print("  Total chunks in DB : {}".format(collection.count()))
+            from onedrive_utils import get_file_size_mb
+            mb = get_file_size_mb(pdf_path)
+            if free_onedrive_file(pdf_path):
+                stats["freed_mb"] += mb
+
+        except Exception as e:
+            log.error("Error processing %s: %s", Path(pdf_path).name, e)
+            progress.setdefault("failed", {})[pdf_path] = str(e)
+            save_progress(progress)
+            stats["failed"] += 1
+            free_onedrive_file(pdf_path)
+
+        # -- periodic disk space report -------------------------------------
+        if i > 0 and i % 50 == 0:
+            log_drive_free_space("C")
+
+    # -- orphan cleanup -----------------------------------------------------
+    orphans_removed = cleanup_orphans(collection, live_hashes, progress)
+
+    # -- final report -------------------------------------------------------
+    log_drive_free_space("C")
+    log.info(
+        "Done.  ingested=%d  metadata_fixed=%d  skipped=%d  "
+        "failed=%d  orphans_removed=%d  freed=%.1f MB",
+        stats["ingested"], stats["metadata_fixed"],
+        stats["skipped"], stats["failed"],
+        orphans_removed, stats["freed_mb"],
+    )
+    log.info("Total chunks in collection: %d", collection.count())
 
 
 if __name__ == "__main__":
-    ingest_papers()
+    main()

@@ -1,3 +1,4 @@
+
 # config.py
 # Central configuration for the Academic Paper RAG system.
 # Edit PAPER_DIRS and Bedrock settings before first use.
@@ -39,22 +40,26 @@ CHUNK_SIZE    = 500
 CHUNK_OVERLAP = 100
 # ---------------------------------------------------------------------------
 # Retrieval  (query.py)
-# N_RETRIEVE : candidate chunks pulled from ChromaDB before reranking
-#              pull more than you need -- reranker selects the best ones
-# N_FINAL    : chunks actually sent to the LLM after reranking
-# USE_HYDE   : generate a hypothetical answer, embed it, and search with that
-#              instead of the raw query -- improves recall on specific questions
+# N_RETRIEVE       : candidate chunks pulled from ChromaDB before reranking
+#                    pull more than you need -- reranker selects the best ones
+# N_FINAL          : chunks actually sent to the LLM after reranking
+# USE_HYDE         : generate a hypothetical answer, embed it, and search with
+#                    that instead of the raw query -- improves recall
+# RERANK_THRESHOLD : minimum cross-encoder score to include a chunk.
+#                    Chunks below this are irrelevant and excluded from the
+#                    prompt.  Set to -100 to disable filtering.
 # ---------------------------------------------------------------------------
-N_RETRIEVE = 20
-N_FINAL    = 6
-USE_HYDE   = True
+N_RETRIEVE       = 20
+N_FINAL          = 6
+USE_HYDE         = True
+RERANK_THRESHOLD = 0.0
 # ---------------------------------------------------------------------------
 # AWS Bedrock
 # Leave the key fields blank -- boto3 reads ~/.aws/credentials automatically.
 # Only fill them in if you need to override the credential file.
 # ---------------------------------------------------------------------------
 BEDROCK_REGION        = "us-east-2"
-BEDROCK_MODEL         = "us.anthropic.claude-sonnet-4-5-20251101-v1:0"
+BEDROCK_MODEL         = "global.anthropic.claude-sonnet-4-6"
 AWS_ACCESS_KEY_ID     = os.environ.get("AWS_ACCESS_KEY_ID",     "")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN     = os.environ.get("AWS_SESSION_TOKEN",     "")
@@ -64,8 +69,6 @@ AWS_SESSION_TOKEN     = os.environ.get("AWS_SESSION_TOKEN",     "")
 # ---------------------------------------------------------------------------
 WEB_SEARCH_ENABLED = False
 TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
-## config.py additions
-
 # ---------------------------------------------------------------------------
 # Full-document mode
 # Full text is sent directly in the context window when the user specifies
@@ -74,3 +77,15 @@ TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
 # At ~4 chars/token, 400k chars ≈ 100k tokens (safe for Claude Sonnet).
 # ---------------------------------------------------------------------------
 MAX_FULL_DOC_CHARS = 400_000
+# ---------------------------------------------------------------------------
+# OneDrive space management
+# ---------------------------------------------------------------------------
+ONEDRIVE_FREE_AFTER_INGEST = True
+ONEDRIVE_PATH_HINT         = "/mnt/c/Users/tonys"
+ONEDRIVE_FREE_ALL          = True
+# ---------------------------------------------------------------------------
+# Ingestion progress tracking
+# Allows resuming interrupted ingest runs without re-processing files.
+# ---------------------------------------------------------------------------
+PROGRESS_FILE = "./db/ingest_progress.json"
+

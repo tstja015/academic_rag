@@ -1,4 +1,4 @@
-## query.py (full rebuild)
+# query.py
 
 """
 query.py -- Interactive RAG query interface for academic papers.
@@ -6,20 +6,17 @@ query.py -- Interactive RAG query interface for academic papers.
 Retrieval modes
 ---------------
 Standard (default):
-    Two-stage retrieval -- SPECTER embeddings via HyDE → top-N candidates →
-    cross-encoder reranking → best chunks sent to Claude.
+    Two-stage retrieval -- SPECTER embeddings via HyDE -> top-N candidates ->
+    cross-encoder reranking -> best chunks sent to Claude.
 
 Full-document mode  (paper: prefix):
     The complete text of the specified paper(s) is extracted from the PDF
-    and sent directly in the context window, exactly as if you had uploaded
-    the file to Claude.  This enables deep analysis, precise equation reading,
-    table interpretation, and cross-section reasoning that chunk-based RAG
-    cannot match.  Use it when you need thorough analysis of a specific paper.
+    and sent directly in the context window.
 
     Syntax:
-        paper:<filename>: <question>
-        paper:<file1>,<file2>: <question>
-        paper:<filename>: summarize
+        paper:<filename>: 
+        paper:,: 
+        paper:: summarize
 """
 
 import os
@@ -59,14 +56,37 @@ class C:
 
 
 # ---------------------------------------------------------------------------
+# Metadata normalisation  (handles old-schema chunks gracefully)
+# ---------------------------------------------------------------------------
+
+def _normalize_meta(meta: dict) -> dict:
+    """
+    Map old-schema metadata keys (source, path, chunk) to the current schema
+    (filename, full_path, section, folder, chunk_index).  Modifies in place.
+    """
+    if "filename" not in meta and "source" in meta:
+        meta["filename"] = meta["source"]
+    if "full_path" not in meta and "path" in meta:
+        meta["full_path"] = meta["path"]
+    if "chunk_index" not in meta and "chunk" in meta:
+        meta["chunk_index"] = meta["chunk"]
+    if "section" not in meta:
+        meta["section"] = "unknown"
+    if "folder" not in meta:
+        path = meta.get("full_path", "")
+        parts = path.replace("\\", "/").split("/")
+        # Try to extract folder from path -- look for 'doc/' marker
+        if "doc" in parts and parts.index("doc") + 1 < len(parts):
+            meta["folder"] = parts[parts.index("doc") + 1]
+        else:
+            meta["folder"] = "unknown"
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # Conversation history
 # ---------------------------------------------------------------------------
 class ConversationHistory:
-    """
-    Rolling window of past Q/A turns prepended to each prompt.
-    Lets the model resolve follow-up references like "they", "that paper",
-    "the method mentioned above", etc.
-    """
     def __init__(self, max_turns: int = 5):
         self.turns:     list = []
         self.max_turns: int  = max_turns
@@ -95,10 +115,6 @@ class ConversationHistory:
 # ---------------------------------------------------------------------------
 
 def load_resources():
-    """
-    Load embedding model, cross-encoder reranker, and ChromaDB collection.
-    All three stay in memory for the lifetime of the process.
-    """
     print("Loading embedding model  : {}".format(config.EMBED_MODEL))
     embedder = SentenceTransformer(config.EMBED_MODEL)
 
@@ -143,11 +159,6 @@ def reset_bedrock_client():
 # ---------------------------------------------------------------------------
 
 def _invoke(prompt: str, max_tokens: int = 4096) -> str | None:
-    """
-    Send *prompt* to Claude via Bedrock.
-    max_tokens is raised to 4096 by default to handle long full-doc answers.
-    Returns None on refusal or unexpected response structure.
-    """
     client = _get_bedrock_client()
     body   = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -196,45 +207,35 @@ def ask_llm_general(question: str) -> str:
 # ---------------------------------------------------------------------------
 
 def resolve_paper_paths(name_tokens: list, collection) -> list:
-    """
-    For each token in *name_tokens*, find the best-matching full_path stored
-    in ChromaDB metadata.
-
-    Matching strategy (in order):
-      1. Exact filename match          e.g. "Smith2023.pdf"
-      2. Case-insensitive filename     e.g. "smith2023.pdf"
-      3. Filename contains the token   e.g. "smith" matches "Smith2023_ADH.pdf"
-      4. full_path contains the token  e.g. partial directory match
-
-    Returns a list of (filename, full_path) tuples for every resolved paper.
-    Prints a warning for any token that could not be resolved.
-    """
-    # Build a deduplicated map:  filename -> full_path
-    all_meta = collection.get(include=["metadatas"])["metadatas"]
     path_map: dict = {}
-    for m in all_meta:
-        fname = m.get("filename", "")
-        fpath = m.get("full_path", "")
-        if fname and fpath and fname not in path_map:
-            path_map[fname] = fpath
+    batch_size = 5000
+    offset = 0
+    total = collection.count()
+
+    while offset < total:
+        batch = collection.get(include=["metadatas"], limit=batch_size, offset=offset)
+        for m in batch["metadatas"]:
+            m = _normalize_meta(m)
+            fname = m.get("filename", "")
+            fpath = m.get("full_path", "")
+            if fname and fpath and fname not in path_map:
+                path_map[fname] = fpath
+        offset += batch_size
 
     resolved = []
     for token in name_tokens:
         token_lower = token.lower()
         match = None
 
-        # 1. Exact
         if token in path_map:
             match = (token, path_map[token])
 
-        # 2. Case-insensitive exact
         if match is None:
             for fname, fpath in path_map.items():
                 if fname.lower() == token_lower:
                     match = (fname, fpath)
                     break
 
-        # 3. Filename contains token
         if match is None:
             candidates = [
                 (fname, fpath)
@@ -244,7 +245,6 @@ def resolve_paper_paths(name_tokens: list, collection) -> list:
             if len(candidates) == 1:
                 match = candidates[0]
             elif len(candidates) > 1:
-                # Prefer shortest filename (most specific match)
                 candidates.sort(key=lambda x: len(x[0]))
                 print("  Ambiguous token '{}' -- matched multiple files:".format(token))
                 for i, (fn, _) in enumerate(candidates):
@@ -253,7 +253,6 @@ def resolve_paper_paths(name_tokens: list, collection) -> list:
                     candidates[0][0]))
                 match = candidates[0]
 
-        # 4. full_path contains token
         if match is None:
             for fname, fpath in path_map.items():
                 if token_lower in fpath.lower():
@@ -266,7 +265,6 @@ def resolve_paper_paths(name_tokens: list, collection) -> list:
             print("  Warning: could not resolve paper '{}'. "
                   "Run 'list' to see indexed filenames.".format(token))
 
-    # Deduplicate while preserving order
     seen   = set()
     unique = []
     for item in resolved:
@@ -278,10 +276,6 @@ def resolve_paper_paths(name_tokens: list, collection) -> list:
 
 
 def extract_full_text(filepath: str) -> str:
-    """
-    Convert a PDF to clean markdown text via pymupdf4llm.
-    Returns the raw markdown string, or an empty string on failure.
-    """
     try:
         return pymupdf4llm.to_markdown(filepath)
     except Exception as exc:
@@ -292,18 +286,6 @@ def extract_full_text(filepath: str) -> str:
 def build_fulldoc_prompt(query:    str,
                           papers:   list,
                           history:  ConversationHistory = None) -> tuple:
-    """
-    Build a prompt that contains the *complete text* of every paper in
-    *papers* (list of (filename, full_text) tuples).
-
-    The total character count is capped at config.MAX_FULL_DOC_CHARS to
-    avoid exceeding the model's context window.  If the combined text is
-    too large, papers are truncated in order (last paper truncated first)
-    with a visible warning.
-
-    Returns:
-        (prompt_string, list_of_included_filenames, was_truncated_bool)
-    """
     max_chars    = getattr(config, "MAX_FULL_DOC_CHARS", 400_000)
     total_chars  = 0
     doc_sections = []
@@ -342,13 +324,13 @@ def build_fulldoc_prompt(query:    str,
 
     paper_block = "\n\n".join(doc_sections)
 
-    if len(papers) == 1:
+    # FIX: use len(included) not len(papers)
+    if len(included) == 1:
         paper_descriptor = "the paper '{}'".format(included[0])
     else:
         paper_descriptor = "{} papers: {}".format(
             len(included), ", ".join(included))
 
-    # Tailor instructions to query type
     query_lower = query.lower().strip()
     is_summary  = query_lower in ("summarize", "summarise", "summary", "")
 
@@ -384,10 +366,10 @@ def build_fulldoc_prompt(query:    str,
     history_block = history.format_for_prompt() if history else ""
 
     prompt = (
-        "{}"            # conversation history
-        "{}\n\n"        # instructions
-        "{}\n\n"        # full paper text(s)
-        "{}\n\n"        # task (summary or question)
+        "{}"
+        "{}\n\n"
+        "{}\n\n"
+        "{}\n\n"
         "ANSWER:"
     ).format(history_block, instructions, paper_block, task)
 
@@ -398,15 +380,6 @@ def ask_fulldoc(query:      str,
                 name_tokens: list,
                 collection,
                 history:    ConversationHistory = None) -> str:
-    """
-    Full-document mode entry point.
-
-    1. Resolve paper name tokens to (filename, full_path) pairs.
-    2. Extract complete text from each PDF.
-    3. Build a prompt containing all full texts.
-    4. Send to Claude with an elevated token budget.
-    5. Display the answer and which files were included.
-    """
     print(C.BOLD + "  [Full-document mode]" + C.RESET)
 
     resolved = resolve_paper_paths(name_tokens, collection)
@@ -435,7 +408,6 @@ def ask_fulldoc(query:      str,
     print("  Sending {:,} chars (~{:,} tokens) to Claude...".format(
         char_count, char_count // 4))
 
-    # Use a higher token budget for full-document analysis
     answer = ask_llm(prompt, max_tokens=8192)
 
     if answer is None:
@@ -464,12 +436,6 @@ def ask_fulldoc(query:      str,
 # ---------------------------------------------------------------------------
 
 def hyde_query_embedding(query: str, embedder) -> list:
-    """
-    Generate a hypothetical answer paragraph and embed it.
-    The embedding of a plausible answer is closer in vector space to real
-    answer chunks than the embedding of the question alone.
-    Falls back to raw query embedding if the LLM call fails.
-    """
     hyde_prompt = (
         "You are a scientific writing assistant.\n"
         "Write a short paragraph (4-6 sentences) that looks like it came from "
@@ -479,11 +445,12 @@ def hyde_query_embedding(query: str, embedder) -> list:
     )
     hypothetical = _invoke(hyde_prompt, max_tokens=200)
 
-    text_to_embed = (
-        hypothetical.strip()
-        if hypothetical and len(hypothetical.strip()) > 20
-        else query
-    )
+    if hypothetical and len(hypothetical.strip()) > 20:
+        text_to_embed = hypothetical.strip()
+    else:
+        print("  [HyDE fallback -- using raw query embedding]")
+        text_to_embed = query
+
     return embedder.encode(text_to_embed).tolist()
 
 
@@ -519,13 +486,6 @@ def retrieve_and_rerank(query:           str,
                         n_retrieve:      int  = None,
                         n_final:         int  = None,
                         use_hyde:        bool = None) -> dict:
-    """
-    Stage 1 -- broad semantic search with SPECTER + optional HyDE.
-    Stage 2 -- cross-encoder reranking of all candidates.
-
-    Returns a dict with keys:
-      documents, metadatas, distances, rerank_scores
-    """
     n_retrieve = n_retrieve if n_retrieve is not None else config.N_RETRIEVE
     n_final    = n_final    if n_final    is not None else config.N_FINAL
     use_hyde   = use_hyde   if use_hyde   is not None else config.USE_HYDE
@@ -559,15 +519,29 @@ def retrieve_and_rerank(query:           str,
 
     scores = reranker.predict([(query, doc) for doc in docs]).tolist()
 
+    # Apply rerank threshold -- drop irrelevant chunks
+    threshold = getattr(config, "RERANK_THRESHOLD", 0.0)
+
     ranked = sorted(
         zip(scores, docs, metas, dists),
         key     = lambda x: x[0],
         reverse = True,
-    )[:n_final]
+    )
+
+    # Filter by threshold, then take top N
+    ranked = [r for r in ranked if r[0] >= threshold][:n_final]
+
+    if not ranked:
+        return {
+            "documents":    [[]],
+            "metadatas":    [[]],
+            "distances":    [[]],
+            "rerank_scores": [],
+        }
 
     return {
         "documents":    [[r[1] for r in ranked]],
-        "metadatas":    [[r[2] for r in ranked]],
+        "metadatas":    [[_normalize_meta(r[2]) for r in ranked]],
         "distances":    [[r[3] for r in ranked]],
         "rerank_scores": [r[0] for r in ranked],
     }
@@ -578,8 +552,7 @@ def retrieve_and_rerank(query:           str,
 # ---------------------------------------------------------------------------
 
 def web_search(query: str, n_results: int = 3) -> tuple:
-    """Try Tavily first; fall back to DuckDuckGo."""
-    tavily_key = os.environ.get("TAVILY_API_KEY") or config.TAVILY_API_KEY
+    tavily_key = os.environ.get("TAVILY_API_KEY") or getattr(config, "TAVILY_API_KEY", "")
 
     if tavily_key:
         try:
@@ -744,6 +717,17 @@ def ask(query:           str,
         filename_filter = filename_filter,
     )
 
+    # Early exit if no relevant chunks survived reranking
+    if not rag_results["documents"][0]:
+        print("  No relevant chunks found (all below rerank threshold).")
+        answer = ask_llm_general(query)
+        print(C.ANSWER +
+              "[Not found in papers -- answering from general knowledge]\n" +
+              answer + C.RESET)
+        if history and answer:
+            history.add(query, answer)
+        return answer
+
     web_results   = []
     search_engine = "none"
 
@@ -778,7 +762,7 @@ def ask(query:           str,
 
 
 # ---------------------------------------------------------------------------
-# Summarize via RAG (no specific paper specified)
+# Summarize via RAG
 # ---------------------------------------------------------------------------
 
 def summarize_paper(target:    str,
@@ -786,12 +770,8 @@ def summarize_paper(target:    str,
                     reranker,
                     collection,
                     history:   ConversationHistory = None):
-    """
-    Summarise using chunk retrieval.
-    For deep single-paper summaries, prefer: paper:<filename>: summarize
-    """
     if not target:
-        print("  Usage: summarize:<filename>  or  summarize:all")
+        print("  Usage: summarize:  or  summarize:all")
         return
 
     print("Summarizing via RAG: {}".format(
@@ -849,13 +829,23 @@ def summarize_paper(target:    str,
 # ---------------------------------------------------------------------------
 
 def list_papers(collection):
-    """Print a deduplicated table of all indexed filenames and folders."""
-    results = collection.get(include=["metadatas"])
     seen: dict = {}
-    for meta in results["metadatas"]:
-        fname = meta.get("filename", "?")
-        if fname not in seen:
-            seen[fname] = meta.get("folder", "?")
+    batch_size = 5000
+    offset = 0
+    total = collection.count()
+
+    while offset < total:
+        results = collection.get(
+            include=["metadatas"],
+            limit=batch_size,
+            offset=offset,
+        )
+        for meta in results["metadatas"]:
+            meta = _normalize_meta(meta)
+            fname = meta.get("filename", "?")
+            if fname not in seen:
+                seen[fname] = meta.get("folder", "?")
+        offset += batch_size
 
     if not seen:
         print("  No papers indexed yet.  Run: python ingest.py")
@@ -866,7 +856,6 @@ def list_papers(collection):
     for fname in sorted(seen):
         print("  {:<55} {}".format(fname, seen[fname]))
     print()
-
 
 # ---------------------------------------------------------------------------
 # Model selector
@@ -922,46 +911,18 @@ def select_model() -> str:
 # ---------------------------------------------------------------------------
 
 def parse_query(raw: str) -> tuple:
-    """
-    Parse all prefix flags from the raw input string.
-
-    Returns:
-        (query, section_filter, folder_filter, force_web,
-         summarize_target, paper_tokens)
-
-    paper_tokens is a list of filename tokens when paper: is used,
-    otherwise None.
-
-    Prefix reference
-    ----------------
-    paper:<name>:              full-document mode for one paper
-    paper:<n1>,<n2>:           full-document mode for multiple papers
-    summarize:<target>         RAG-based summary (exclusive)
-    methods:                   restrict to methods sections
-    results:                   restrict to results sections
-    folder:<name>:             restrict to a topic folder
-    web:                       force web search
-
-    All prefixes except summarize: and paper: are composable.
-    """
     query = raw.strip()
 
-    # -- paper:  full-document mode (exclusive) -------------------------
-    # Syntax: paper:<name>: <question>
-    #     or: paper:<n1>,<n2>: <question>
-    #     or: paper:<name>: summarize
     m = re.match(r"^paper:(.+?):\s*(.*)", query, re.IGNORECASE)
     if m:
-        names_raw   = m.group(1).strip()
-        rest_query  = m.group(2).strip()
+        names_raw    = m.group(1).strip()
+        rest_query   = m.group(2).strip()
         paper_tokens = [t.strip() for t in names_raw.split(",") if t.strip()]
         return rest_query, None, None, False, None, paper_tokens
 
-    # -- summarize:  RAG summary (exclusive) ----------------------------
     if query.lower().startswith("summarize:"):
         return None, None, None, False, query[10:].strip(), None
 
-    # -- composable flags -----------------------------------------------
     section_filter = None
     folder_filter  = None
     force_web      = False
@@ -1005,19 +966,21 @@ if __name__ == "__main__":
     print("  Embeddings   : {}".format(config.EMBED_MODEL))
     print("  Reranker     : {}".format(config.RERANK_MODEL))
     print("  HyDE         : {}".format("on" if config.USE_HYDE else "off"))
+    print("  Rerank min   : {}".format(
+        getattr(config, "RERANK_THRESHOLD", 0.0)))
     print("  Web search   : {} (toggle: webon / weboff)".format(web_status))
     print("  Chunks in DB : {}".format(collection.count()))
     print("=" * 62)
     print()
     print("Query prefixes:")
-    print("  paper:<filename>: <question>   deep analysis -- full PDF sent to model")
-    print("  paper:<f1>,<f2>: <question>    deep analysis of multiple papers")
-    print("  paper:<filename>: summarize    deep summary of one paper")
+    print("  paper::    deep analysis -- full PDF sent to model")
+    print("  paper:,:     deep analysis of multiple papers")
+    print("  paper:: summarize    deep summary of one paper")
     print("  methods:                       search only methods sections")
     print("  results:                       search only results sections")
-    print("  folder:<name>:                 search only that topic folder")
+    print("  folder::                 search only that topic folder")
     print("  web:                           force web search for this query")
-    print("  summarize:<filename>           RAG-based summary (chunk retrieval)")
+    print("  summarize:           RAG-based summary (chunk retrieval)")
     print("  summarize:all                  RAG-based summary across all papers")
     print()
     print("Commands:")
@@ -1083,7 +1046,6 @@ if __name__ == "__main__":
          summarize_target,
          paper_tokens) = parse_query(raw)
 
-        # -- Full-document mode -----------------------------------------
         if paper_tokens is not None:
             ask_fulldoc(
                 query       = query,
@@ -1092,7 +1054,6 @@ if __name__ == "__main__":
                 history     = history,
             )
 
-        # -- RAG summary ------------------------------------------------
         elif summarize_target is not None:
             summarize_paper(
                 target     = summarize_target,
@@ -1102,7 +1063,6 @@ if __name__ == "__main__":
                 history    = history,
             )
 
-        # -- Standard RAG -----------------------------------------------
         else:
             ask(
                 query          = query,

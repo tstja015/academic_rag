@@ -3,14 +3,24 @@ pymupdf4llm
 chromadb
 sentence-transformers
 torch
+
 # AWS
 boto3
+
 # NLP utilities
 nltk
+
 # Progress / display
 tqdm
 httpx
-# Web search (both are optional -- system falls back gracefully)
+
+# Web search (both optional -- system falls back gracefully)
 duckduckgo-search
 tavily-python
+
+# OCR for scanned PDFs (optional -- only needed for ocr_scanned.py)
+ocrmypdf
+
+# PDF extraction (PyMuPDF -- used by both ingest.py and pymupdf4llm)
+PyMuPDF
 
