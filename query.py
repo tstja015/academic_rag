@@ -437,22 +437,44 @@ def ask_fulldoc(query:      str,
 
 def hyde_query_embedding(query: str, embedder) -> list:
     hyde_prompt = (
-        "You are a scientific writing assistant.\n"
-        "Write a short paragraph (4-6 sentences) that looks like it came from "
-        "an academic paper and directly answers the following question.\n"
-        "Write only the paragraph -- no preamble, no labels.\n\n"
-        "Question: {}\n\nParagraph:".format(query)
+        "You are a scientific search assistant.\n"
+        "Given the user's question, generate a short academic paper TITLE and "
+        "ABSTRACT (3-4 sentences) that would answer this question.\n"
+        "Write ONLY the title and abstract — no labels, no preamble.\n\n"
+        "Question: {}\n\nTitle and Abstract:".format(query)
     )
     hypothetical = _invoke(hyde_prompt, max_tokens=200)
 
     if hypothetical and len(hypothetical.strip()) > 20:
         text_to_embed = hypothetical.strip()
+        print("  [HyDE] Generated search document ({} chars)".format(
+            len(text_to_embed)))
     else:
         print("  [HyDE fallback -- using raw query embedding]")
         text_to_embed = query
 
     return embedder.encode(text_to_embed).tolist()
 
+
+# ---------------------------------------------------------------------------
+# Expand acronyms before embedding
+# ---------------------------------------------------------------------------
+
+def expand_query(query: str) -> str:
+    """Ask the LLM to expand acronyms and clarify ambiguous terms."""
+    prompt = (
+        "You are a scientific search query optimizer.\n"
+        "Expand all acronyms and rewrite the following query as a precise "
+        "scientific search query. Keep it under 30 words.\n"
+        "Write ONLY the rewritten query — nothing else.\n\n"
+        "Original: {}\n\nRewritten:".format(query)
+    )
+    result = _invoke(prompt, max_tokens=100)
+    if result and len(result.strip()) > 10:
+        expanded = result.strip().split("\n")[0]  # take first line only
+        print("  [Query expansion] {} -> {}".format(query, expanded))
+        return expanded
+    return query
 
 # ---------------------------------------------------------------------------
 # Standard retrieval + reranking
@@ -475,7 +497,6 @@ def _build_where_filter(section_filter  = None,
         return conditions[0]
     return {"$and": conditions}
 
-
 def retrieve_and_rerank(query:           str,
                         collection,
                         embedder,
@@ -490,10 +511,13 @@ def retrieve_and_rerank(query:           str,
     n_final    = n_final    if n_final    is not None else config.N_FINAL
     use_hyde   = use_hyde   if use_hyde   is not None else config.USE_HYDE
 
+    # -- Expand acronyms / clarify ambiguous terms --------------------------
+    search_query = expand_query(query)
+
     query_vec = (
-        hyde_query_embedding(query, embedder)
+        hyde_query_embedding(search_query, embedder)
         if use_hyde
-        else embedder.encode(query).tolist()
+        else embedder.encode(search_query).tolist()
     )
 
     where = _build_where_filter(section_filter, folder_filter, filename_filter)
@@ -517,9 +541,9 @@ def retrieve_and_rerank(query:           str,
             "rerank_scores": [],
         }
 
+    # -- Rerank against the ORIGINAL query (not expanded) -------------------
     scores = reranker.predict([(query, doc) for doc in docs]).tolist()
 
-    # Apply rerank threshold -- drop irrelevant chunks
     threshold = getattr(config, "RERANK_THRESHOLD", 0.0)
 
     ranked = sorted(
@@ -528,7 +552,6 @@ def retrieve_and_rerank(query:           str,
         reverse = True,
     )
 
-    # Filter by threshold, then take top N
     ranked = [r for r in ranked if r[0] >= threshold][:n_final]
 
     if not ranked:

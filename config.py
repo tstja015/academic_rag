@@ -28,7 +28,7 @@ COLLECTION_NAME = "academic_papers"
 # Reranker         : cross-encoder reads query+chunk together, much more accurate
 #                    than cosine similarity alone
 # ---------------------------------------------------------------------------
-EMBED_MODEL  = "allenai-specter"
+EMBED_MODEL  = "BAAI/bge-base-en-v1.5" # "intfloat/e5-large-v2" #"allenai-specter"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 # ---------------------------------------------------------------------------
 # Chunking  (ingest.py)
@@ -49,10 +49,10 @@ CHUNK_OVERLAP = 100
 #                    Chunks below this are irrelevant and excluded from the
 #                    prompt.  Set to -100 to disable filtering.
 # ---------------------------------------------------------------------------
-N_RETRIEVE       = 20
-N_FINAL          = 6
+N_RETRIEVE       = 40
+N_FINAL          = 8
 USE_HYDE         = True
-RERANK_THRESHOLD = 0.0
+RERANK_THRESHOLD = -5.0 # If this doesn't work, just do -100
 # ---------------------------------------------------------------------------
 # AWS Bedrock
 # Leave the key fields blank -- boto3 reads ~/.aws/credentials automatically.
