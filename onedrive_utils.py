@@ -68,6 +68,45 @@ def get_file_size_mb(path):
     except OSError:
         return 0.0
 
+def cleanup_onedrive_logs():
+    """
+    Delete accumulated OneDrive .odl log files that can grow to hundreds of GB.
+    Safe to call at any time -- OneDrive recreates logs as needed.
+    Works from WSL (via /mnt/c) or native Windows.
+    """
+    if IS_WSL:
+        # Build path via /mnt/c
+        local_app_data = "/mnt/c/Users"
+        # Try to find the username from the ONEDRIVE_PATH_HINT
+        hint = getattr(config, "ONEDRIVE_PATH_HINT", "")
+        # hint is like /mnt/c/Users/tonys
+        hint_path = Path(hint)
+        username = hint_path.name  # "tonys"
+        log_dir = Path(f"/mnt/c/Users/{username}/AppData/Local/Microsoft/OneDrive/logs")
+    else:
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        log_dir = Path(local_app_data) / "Microsoft" / "OneDrive" / "logs"
+
+    if not log_dir.exists():
+        log.debug("OneDrive log dir not found, skipping cleanup: %s", log_dir)
+        return
+
+    deleted = 0
+    freed_mb = 0.0
+    for f in log_dir.rglob("*.odl"):
+        try:
+            freed_mb += f.stat().st_size / 1_048_576
+            f.unlink()
+            deleted += 1
+        except Exception as e:
+            log.debug("Could not delete log file %s: %s", f, e)
+
+    if deleted:
+        log.info("OneDrive log cleanup: deleted %d files, freed %.1f MB",
+                 deleted, freed_mb)
+    else:
+        log.debug("OneDrive log cleanup: nothing to delete.")
+
 def free_onedrive_file(path):
     if not getattr(config, "ONEDRIVE_FREE_AFTER_INGEST", False):
         return False

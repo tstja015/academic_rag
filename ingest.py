@@ -26,7 +26,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 import config
-from onedrive_utils import free_onedrive_file, log_drive_free_space
+from onedrive_utils import free_onedrive_file, log_drive_free_space, cleanup_onedrive_logs  # add cleanup_onedrive_log
 
 # -- logging ----------------------------------------------------------------
 logging.basicConfig(
@@ -460,6 +460,10 @@ def main():
     completed_set = set(progress["completed"])
     log.info("Already completed: %d files", len(completed_set))
 
+    # -- clean OneDrive logs before starting --------------------------------
+    log.info("Cleaning OneDrive logs before ingest...")
+    cleanup_onedrive_logs()
+
     # -- report starting disk space -----------------------------------------
     log_drive_free_space("C")
 
@@ -472,11 +476,10 @@ def main():
         "freed_mb":       0.0,
     }
 
-    live_hashes = set()  # built during loop, used by orphan cleanup
+    live_hashes = set()
 
     for i, pdf_path in enumerate(tqdm(all_pdfs, desc="Ingesting papers")):
 
-        # -- hash the file --------------------------------------------------
         try:
             fhash = file_hash(pdf_path)
         except OSError as e:
@@ -486,7 +489,6 @@ def main():
 
         live_hashes.add(fhash)
 
-        # -- already ingested: check for rename/move ------------------------
         if fhash in completed_set:
             status = check_and_update_metadata(fhash, pdf_path, collection)
 
@@ -502,9 +504,6 @@ def main():
                 free_onedrive_file(pdf_path)
                 continue
 
-            # status == "missing" -- fall through to full ingest
-
-        # -- skip known bad files -------------------------------------------
         if pdf_path in progress.get("failed", {}):
             log.debug("Previously failed, skipping: %s",
                       Path(pdf_path).name)
@@ -512,7 +511,6 @@ def main():
             free_onedrive_file(pdf_path)
             continue
 
-        # -- process --------------------------------------------------------
         try:
             ingest_one(pdf_path, collection, embed_model, fhash)
 
@@ -534,12 +532,17 @@ def main():
             stats["failed"] += 1
             free_onedrive_file(pdf_path)
 
-        # -- periodic disk space report -------------------------------------
+        # -- periodic disk space report + log cleanup every 50 files -------
         if i > 0 and i % 50 == 0:
             log_drive_free_space("C")
+            cleanup_onedrive_logs()  # logs can accumulate during long runs
 
     # -- orphan cleanup -----------------------------------------------------
     orphans_removed = cleanup_orphans(collection, live_hashes, progress)
+
+    # -- final OneDrive log cleanup -----------------------------------------
+    log.info("Final OneDrive log cleanup...")
+    cleanup_onedrive_logs()
 
     # -- final report -------------------------------------------------------
     log_drive_free_space("C")
@@ -551,7 +554,6 @@ def main():
         orphans_removed, stats["freed_mb"],
     )
     log.info("Total chunks in collection: %d", collection.count())
-
 
 if __name__ == "__main__":
     main()
