@@ -1,13 +1,16 @@
+
 # ingest.py
 """
 Ingest academic PDFs into ChromaDB with:
   - Resume capability (skips already-ingested files via SHA-256 hash)
+  - Path-indexed fast-skip (no disk read or ChromaDB call for known files)
   - Rename/move detection (updates metadata in place -- no re-embedding)
   - Idempotent re-ingestion (removes stale chunks before inserting)
   - Orphan cleanup (removes chunks whose source PDFs no longer exist)
   - Per-file error isolation (one bad PDF won't kill the run)
   - Section detection for chunk metadata
   - OneDrive eviction after each successful ingest (WSL-aware)
+  - OneDrive log cleanup at start, periodically, and at end
   - Periodic disk space reporting
 """
 
@@ -20,13 +23,21 @@ import logging
 from pathlib import Path
 from tqdm import tqdm
 
+import argparse
+
 import fitz  # PyMuPDF
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 import config
-from onedrive_utils import free_onedrive_file, log_drive_free_space, cleanup_onedrive_logs  # add cleanup_onedrive_log
+from onedrive_utils import (
+    free_onedrive_file,
+    free_onedrive_files_bulk,
+    get_file_size_mb,
+    log_drive_free_space,
+    cleanup_onedrive_logs,
+)
 
 # -- logging ----------------------------------------------------------------
 logging.basicConfig(
@@ -42,11 +53,36 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def load_progress() -> dict:
+    """
+    Load ingest progress from disk.
+
+    Schema
+    ------
+    {
+        "completed":  ["<sha256>", ...],          # hashes of ingested files
+        "path_index": {"/abs/path": ""},  # fast-skip lookup
+        "failed":     {"/abs/path": ""}    # paths that errored
+    }
+
+    Automatically migrates the old schema (no path_index key) on first load.
+    """
     pf = getattr(config, "PROGRESS_FILE", "./db/ingest_progress.json")
     if os.path.exists(pf):
         with open(pf) as f:
-            return json.load(f)
-    return {"completed": [], "failed": {}}
+            data = json.load(f)
+
+        # -- migrate old schema (list-only) to path-indexed schema ----------
+        if "path_index" not in data:
+            log.info(
+                "Migrating progress file to path-indexed schema "
+                "(first run only -- subsequent runs will be much faster)"
+            )
+            data["path_index"] = {}
+            save_progress(data)
+
+        return data
+
+    return {"completed": [], "path_index": {}, "failed": {}}
 
 
 def save_progress(progress: dict):
@@ -80,8 +116,10 @@ def collect_pdfs() -> list:
                 if fn.lower().endswith(".pdf"):
                     pdfs.append(os.path.join(root, fn))
     unique = sorted(set(pdfs))
-    log.info("Found %d unique PDFs across %d directories",
-             len(unique), len(config.PAPER_DIRS))
+    log.info(
+        "Found %d unique PDFs across %d directories",
+        len(unique), len(config.PAPER_DIRS),
+    )
     return unique
 
 
@@ -158,7 +196,7 @@ def extract_folder(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def chunk_text(text: str) -> list:
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences   = re.split(r'(?<=[.!?])\s+', text)
     chunks      = []
     current     = []
     current_len = 0
@@ -189,11 +227,12 @@ def check_and_update_metadata(fhash: str, current_path: str,
     """
     Check whether stored metadata matches the current file path.
 
-    Returns:
-      "match"   -- everything is current, skip
-      "updated" -- metadata was stale and has been updated in place
-      "missing" -- no chunks found for this hash, needs full ingest
-      "error"   -- could not check (old schema), treat as skip
+    Returns
+    -------
+    "match"   -- everything is current, skip
+    "updated" -- metadata was stale and has been updated in place
+    "missing" -- no chunks found for this hash, needs full ingest
+    "error"   -- could not check (old schema), treat as skip
     """
     current_filename = Path(current_path).name
     current_abspath  = os.path.abspath(current_path)
@@ -201,15 +240,17 @@ def check_and_update_metadata(fhash: str, current_path: str,
 
     try:
         existing = collection.get(
-            where={"file_hash": {"$eq": fhash}},
-            include=["metadatas"],
+            where   = {"file_hash": {"$eq": fhash}},
+            include = ["metadatas"],
         )
     except Exception:
         return "error"
 
     if not existing["ids"]:
-        log.info("No chunks found for hash %s... -- will ingest %s",
-                 fhash[:12], current_filename)
+        log.info(
+            "No chunks found for hash %s... -- will ingest %s",
+            fhash[:12], current_filename,
+        )
         return "missing"
 
     stored_meta     = existing["metadatas"][0]
@@ -220,11 +261,15 @@ def check_and_update_metadata(fhash: str, current_path: str,
         return "match"
 
     if stored_filename != current_filename:
-        log.info("Rename detected: '%s' -> '%s'  (updating metadata)",
-                 stored_filename, current_filename)
+        log.info(
+            "Rename detected: '%s' -> '%s'  (updating metadata)",
+            stored_filename, current_filename,
+        )
     elif stored_path != current_abspath:
-        log.info("Move detected: '%s' -> '%s'  (updating metadata)",
-                 stored_path, current_abspath)
+        log.info(
+            "Move detected: '%s' -> '%s'  (updating metadata)",
+            stored_path, current_abspath,
+        )
 
     updated_metas = []
     for meta in existing["metadatas"]:
@@ -252,13 +297,15 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
     # -- Remove any existing chunks for this file hash ----------------------
     try:
         existing = collection.get(
-            where={"file_hash": {"$eq": fhash}},
-            include=[],
+            where   = {"file_hash": {"$eq": fhash}},
+            include = [],
         )
         if existing["ids"]:
             collection.delete(ids=existing["ids"])
-            log.info("  Removed %d stale chunks (hash %s...)",
-                     len(existing["ids"]), fhash[:12])
+            log.info(
+                "  Removed %d stale chunks (hash %s...)",
+                len(existing["ids"]), fhash[:12],
+            )
     except Exception:
         pass
 
@@ -283,7 +330,9 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
     batch_size = 32
     for i in range(0, len(chunks), batch_size):
         batch      = chunks[i:i + batch_size]
-        embeddings = embed_model.encode(batch, show_progress_bar=False).tolist()
+        embeddings = embed_model.encode(
+            batch, show_progress_bar=False
+        ).tolist()
 
         ids       = [f"{fhash}_{i + j}" for j in range(len(batch))]
         metadatas = [
@@ -312,7 +361,9 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
         sec = detect_section(c)
         section_counts[sec] = section_counts.get(sec, 0) + 1
 
-    section_summary = ", ".join(f"{s}:{n}" for s, n in sorted(section_counts.items()))
+    section_summary = ", ".join(
+        f"{s}:{n}" for s, n in sorted(section_counts.items())
+    )
 
     log.info(
         "Ingested %-50s  |  chunks: %3d  |  pages: %3d  |  words: %6d  |  "
@@ -329,6 +380,7 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
         section_summary,
     )
 
+
 # ---------------------------------------------------------------------------
 # Orphan cleanup
 # ---------------------------------------------------------------------------
@@ -342,7 +394,7 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
 
     batch_size    = 10_000
     offset        = 0
-    stored_hashes = {}  # hash -> {"filename": ..., "count": ...}
+    stored_hashes = {}   # hash -> {"filename": ..., "count": ...}
 
     total = collection.count()
     if total == 0:
@@ -368,8 +420,10 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
 
     if not stored_hashes:
         log.info("  No file_hash metadata found -- skipping cleanup.")
-        log.info("  (Old-schema chunks cannot be cleaned automatically.  "
-                 "Run: rm -rf ./db && python ingest.py)")
+        log.info(
+            "  (Old-schema chunks cannot be cleaned automatically.  "
+            "Run: rm -rf ./db && python ingest.py)"
+        )
         return 0
 
     orphan_hashes = set(stored_hashes.keys()) - live_hashes
@@ -381,8 +435,10 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
     log.info("  Found %d orphaned file hash(es):", len(orphan_hashes))
     for oh in sorted(orphan_hashes):
         info = stored_hashes[oh]
-        log.info("    %s...  %s  (%d chunks)",
-                 oh[:12], info["filename"], info["count"])
+        log.info(
+            "    %s...  %s  (%d chunks)",
+            oh[:12], info["filename"], info["count"],
+        )
 
     total_removed = 0
     for oh in orphan_hashes:
@@ -394,11 +450,15 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
             if existing["ids"]:
                 collection.delete(ids=existing["ids"])
                 total_removed += len(existing["ids"])
-                log.info("    Deleted %d chunks for hash %s...",
-                         len(existing["ids"]), oh[:12])
+                log.info(
+                    "    Deleted %d chunks for hash %s...",
+                    len(existing["ids"]), oh[:12],
+                )
         except Exception as e:
-            log.warning("    Failed to delete chunks for hash %s...: %s",
-                        oh[:12], e)
+            log.warning(
+                "    Failed to delete chunks for hash %s...: %s",
+                oh[:12], e,
+            )
 
     # -- Clean progress file ------------------------------------------------
     before_count = len(progress["completed"])
@@ -406,6 +466,16 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
         h for h in progress["completed"] if h not in orphan_hashes
     ]
     removed_from_progress = before_count - len(progress["completed"])
+
+    # Remove orphaned entries from path_index too
+    path_index = progress.get("path_index", {})
+    stale_paths = [p for p, h in path_index.items() if h in orphan_hashes]
+    for p in stale_paths:
+        del path_index[p]
+    if stale_paths:
+        log.info(
+            "  Removed %d stale path_index entries.", len(stale_paths)
+        )
 
     if "failed" in progress:
         old_failed = dict(progress["failed"])
@@ -415,23 +485,117 @@ def cleanup_orphans(collection, live_hashes: set, progress: dict) -> int:
         }
         removed_failed = len(old_failed) - len(progress["failed"])
         if removed_failed:
-            log.info("  Removed %d stale entries from failed list.",
-                     removed_failed)
+            log.info(
+                "  Removed %d stale entries from failed list.",
+                removed_failed,
+            )
 
     if removed_from_progress:
-        log.info("  Removed %d stale entries from progress file.",
-                 removed_from_progress)
+        log.info(
+            "  Removed %d stale entries from progress file.",
+            removed_from_progress,
+        )
 
     save_progress(progress)
-    log.info("  Cleanup complete: %d orphaned chunks removed.", total_removed)
+    log.info(
+        "  Cleanup complete: %d orphaned chunks removed.", total_removed
+    )
     return total_removed
+
+
+# ---------------------------------------------------------------------------
+# Index builder
+# ---------------------------------------------------------------------------
+
+def build_path_index(all_pdfs: list, completed_set: set,
+                     path_index: dict, progress: dict):
+    """
+    First-run index builder.
+
+    Hashes every unindexed PDF whose hash is already in completed_set and
+    writes the abs_path -> hash mapping into path_index in-place.  Saves
+    in batches of 100 so a mid-run restart doesn't lose all progress.
+
+    Files whose hash is NOT in completed_set are left out -- they will be
+    picked up by the main ingest loop as genuinely new files.
+
+    This function is a no-op on all subsequent runs once every path has
+    been indexed.
+    """
+    unindexed = [
+        p for p in all_pdfs
+        if os.path.abspath(p) not in path_index
+    ]
+
+    if not unindexed:
+        log.info("Path index is current -- no hashing needed.")
+        return
+
+    log.info(
+        "Building path index for %d unindexed files "
+        "(hashing only, no embedding)...",
+        len(unindexed),
+    )
+
+    dirty      = 0   # unsaved changes since last save
+    save_every = 100
+
+    for pdf_path in tqdm(unindexed, desc="Building path index"):
+        abs_path = os.path.abspath(pdf_path)
+        try:
+            fhash = file_hash(pdf_path)
+        except OSError as e:
+            log.warning("Cannot hash %s: %s", pdf_path, e)
+            continue
+
+        # Only index files we have already successfully ingested.
+        # New files are intentionally left out so the main loop handles them.
+        if fhash in completed_set:
+            path_index[abs_path] = fhash
+            dirty += 1
+
+        if dirty >= save_every:
+            progress["path_index"] = path_index
+            save_progress(progress)
+            dirty = 0
+
+    # -- final flush --------------------------------------------------------
+    if dirty:
+        progress["path_index"] = path_index
+        save_progress(progress)
+
+    indexed = sum(
+        1 for p in all_pdfs
+        if os.path.abspath(p) in path_index
+    )
+    log.info(
+        "Path index complete: %d / %d files indexed.",
+        indexed, len(all_pdfs),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+```python
 def main():
+    # -- Argument parsing ---------------------------------------------------
+    parser = argparse.ArgumentParser(description="Ingest academic PDFs into ChromaDB")
+    parser.add_argument(
+        "--dir",
+        metavar="DIR",
+        default=None,
+        help="If specified, only ingest PDFs under this directory.",
+    )
+    args = parser.parse_args()
+
+    filter_dir = os.path.abspath(args.dir) if args.dir else None
+
+    if filter_dir and not os.path.isdir(filter_dir):
+        log.error("--dir does not exist or is not a directory: %s", filter_dir)
+        sys.exit(1)
+
     # -- ChromaDB -----------------------------------------------------------
     os.makedirs(config.DB_DIR, exist_ok=True)
     client = chromadb.PersistentClient(
@@ -442,43 +606,106 @@ def main():
         name     = config.COLLECTION_NAME,
         metadata = {"hnsw:space": "cosine"},
     )
-    log.info("Collection '%s' has %d existing chunks",
-             config.COLLECTION_NAME, collection.count())
+    log.info(
+        "Collection '%s' has %d existing chunks",
+        config.COLLECTION_NAME, collection.count(),
+    )
 
-    # -- embedding model ----------------------------------------------------
+    # -- Embedding model ----------------------------------------------------
     log.info("Loading embedding model: %s", config.EMBED_MODEL)
     embed_model = SentenceTransformer(config.EMBED_MODEL)
 
-    # -- collect files ------------------------------------------------------
-    all_pdfs = collect_pdfs()
-    if not all_pdfs:
-        log.error("No PDFs found. Check PAPER_DIRS in config.py")
-        sys.exit(1)
+    # -- Collect files ------------------------------------------------------
+    if filter_dir:
+        all_pdfs = []
+        for root, _, files in os.walk(filter_dir):
+            for fn in files:
+                if fn.lower().endswith(".pdf"):
+                    all_pdfs.append(os.path.join(root, fn))
+        all_pdfs = sorted(set(all_pdfs))
+        log.info(
+            "Scoped run: found %d PDF(s) under %s",
+            len(all_pdfs), filter_dir,
+        )
+        if not all_pdfs:
+            log.error("No PDFs found under --dir: %s", filter_dir)
+            sys.exit(1)
+    else:
+        all_pdfs = collect_pdfs()
+        if not all_pdfs:
+            log.error("No PDFs found. Check PAPER_DIRS in config.py")
+            sys.exit(1)
 
-    # -- load resume state --------------------------------------------------
+    # -- Load resume state --------------------------------------------------
     progress      = load_progress()
-    completed_set = set(progress["completed"])
-    log.info("Already completed: %d files", len(completed_set))
+    completed_set = set(progress["completed"])      # set of hashes
+    path_index    = progress.get("path_index", {})  # {abs_path -> hash}
+    log.info(
+        "Already completed: %d files  |  path index: %d entries",
+        len(completed_set), len(path_index),
+    )
 
-    # -- clean OneDrive logs before starting --------------------------------
+    # -- Clean OneDrive logs before starting --------------------------------
     log.info("Cleaning OneDrive logs before ingest...")
     cleanup_onedrive_logs()
 
-    # -- report starting disk space -----------------------------------------
+    # -- Report starting disk space -----------------------------------------
     log_drive_free_space("C")
 
-    # -- main ingest loop ---------------------------------------------------
+    # -- Build path index ---------------------------------------------------
+    build_path_index(all_pdfs, completed_set, path_index, progress)
+
+    # -- Partition: fast-skip vs needs-check --------------------------------
+    fast_skip   = []
+    needs_check = []
+
+    for pdf_path in all_pdfs:
+        abs_path    = os.path.abspath(pdf_path)
+        stored_hash = path_index.get(abs_path)
+        if stored_hash and stored_hash in completed_set:
+            fast_skip.append(pdf_path)
+        else:
+            needs_check.append(pdf_path)
+
+    log.info(
+        "Fast-skip: %d files  |  Need checking: %d files",
+        len(fast_skip), len(needs_check),
+    )
+
+    # -- Bulk-free fast-skip OneDrive files ---------------------------------
+    freed_mb = 0.0
+    if fast_skip:
+        log.info(
+            "Releasing %d already-ingested OneDrive files (bulk)...",
+            len(fast_skip),
+        )
+        bulk = free_onedrive_files_bulk(fast_skip)
+        freed_mb += bulk["mb_reclaimed"]
+        log.info(
+            "  Bulk free: freed=%d  skipped=%d  reclaimed=%.1f MB",
+            bulk["freed"], bulk["skipped"], bulk["mb_reclaimed"],
+        )
+
+    # -- Live hashes for orphan cleanup ------------------------------------
+    live_hashes: set = {
+        path_index[os.path.abspath(p)]
+        for p in fast_skip
+        if os.path.abspath(p) in path_index
+    }
+
+    # -- Stats -------------------------------------------------------------
     stats = {
         "ingested":       0,
         "skipped":        0,
         "metadata_fixed": 0,
         "failed":         0,
-        "freed_mb":       0.0,
+        "freed_mb":       freed_mb,
     }
 
-    live_hashes = set()
+    # -- Main ingest loop --------------------------------------------------
+    for i, pdf_path in enumerate(tqdm(needs_check, desc="Ingesting papers")):
 
-    for i, pdf_path in enumerate(tqdm(all_pdfs, desc="Ingesting papers")):
+        abs_path = os.path.abspath(pdf_path)
 
         try:
             fhash = file_hash(pdf_path)
@@ -489,38 +716,53 @@ def main():
 
         live_hashes.add(fhash)
 
+        # -- Already ingested: check for rename/move -----------------------
         if fhash in completed_set:
             status = check_and_update_metadata(fhash, pdf_path, collection)
 
-            if status == "match" or status == "error":
-                log.debug("Already ingested, skipping: %s",
-                          Path(pdf_path).name)
+            if status == "match":
+                path_index[abs_path] = fhash
+                progress["path_index"] = path_index
+                save_progress(progress)
+                stats["skipped"] += 1
+                free_onedrive_file(pdf_path)
+                continue
+
+            elif status == "error":
                 stats["skipped"] += 1
                 free_onedrive_file(pdf_path)
                 continue
 
             elif status == "updated":
+                path_index[abs_path] = fhash
+                progress["path_index"] = path_index
+                save_progress(progress)
                 stats["metadata_fixed"] += 1
                 free_onedrive_file(pdf_path)
                 continue
 
+            # status == "missing" -- fall through to full ingest
+
+        # -- Skip known bad files ------------------------------------------
         if pdf_path in progress.get("failed", {}):
-            log.debug("Previously failed, skipping: %s",
-                      Path(pdf_path).name)
+            log.debug("Previously failed, skipping: %s", Path(pdf_path).name)
             stats["skipped"] += 1
             free_onedrive_file(pdf_path)
             continue
 
+        # -- Full ingest ---------------------------------------------------
         try:
             ingest_one(pdf_path, collection, embed_model, fhash)
 
             if fhash not in completed_set:
                 progress["completed"].append(fhash)
                 completed_set.add(fhash)
+
+            path_index[abs_path] = fhash
+            progress["path_index"] = path_index
             save_progress(progress)
             stats["ingested"] += 1
 
-            from onedrive_utils import get_file_size_mb
             mb = get_file_size_mb(pdf_path)
             if free_onedrive_file(pdf_path):
                 stats["freed_mb"] += mb
@@ -532,19 +774,26 @@ def main():
             stats["failed"] += 1
             free_onedrive_file(pdf_path)
 
-        # -- periodic disk space report + log cleanup every 50 files -------
+        # -- Periodic disk space report + log cleanup ----------------------
         if i > 0 and i % 50 == 0:
             log_drive_free_space("C")
-            cleanup_onedrive_logs()  # logs can accumulate during long runs
+            cleanup_onedrive_logs()
 
-    # -- orphan cleanup -----------------------------------------------------
-    orphans_removed = cleanup_orphans(collection, live_hashes, progress)
+    # -- Orphan cleanup (skipped for scoped runs) --------------------------
+    if filter_dir:
+        log.info(
+            "Skipping orphan cleanup -- scoped run via --dir does not "
+            "have visibility into all files."
+        )
+        orphans_removed = 0
+    else:
+        orphans_removed = cleanup_orphans(collection, live_hashes, progress)
 
-    # -- final OneDrive log cleanup -----------------------------------------
+    # -- Final OneDrive log cleanup ----------------------------------------
     log.info("Final OneDrive log cleanup...")
     cleanup_onedrive_logs()
 
-    # -- final report -------------------------------------------------------
+    # -- Final report ------------------------------------------------------
     log_drive_free_space("C")
     log.info(
         "Done.  ingested=%d  metadata_fixed=%d  skipped=%d  "
@@ -554,6 +803,7 @@ def main():
         orphans_removed, stats["freed_mb"],
     )
     log.info("Total chunks in collection: %d", collection.count())
+
 
 if __name__ == "__main__":
     main()
