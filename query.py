@@ -938,7 +938,7 @@ def summarize_paper(target:    str,
 # List indexed papers
 # ---------------------------------------------------------------------------
 
-def list_papers(collection):
+def list_papers(collection, pattern: str = None):
     seen: dict = {}
     batch_size = 5000
     offset = 0
@@ -961,10 +961,32 @@ def list_papers(collection):
         print("  No papers indexed yet.  Run: python ingest.py")
         return
 
-    print("\n{} paper{} indexed:\n".format(
-        len(seen), "" if len(seen) == 1 else "s"))
-    for fname in sorted(seen):
-        print("  {:<55} {}".format(fname, seen[fname]))
+    # Apply filter if given
+    if pattern:
+        import fnmatch
+        pattern_lower = pattern.lower()
+        # Support both wildcard and plain substring search
+        if "*" in pattern or "?" in pattern:
+            matched = {f: v for f, v in seen.items()
+                       if fnmatch.fnmatch(f.lower(), pattern_lower)}
+        else:
+            matched = {f: v for f, v in seen.items()
+                       if pattern_lower in f.lower()}
+    else:
+        matched = seen
+
+    if not matched:
+        print("  No papers matched '{}'.".format(pattern))
+        print("  {} total papers indexed.".format(len(seen)))
+        return
+
+    print("\n{} paper{} matched{}:\n".format(
+        len(matched),
+        "" if len(matched) == 1 else "s",
+        " '{}'".format(pattern) if pattern else "",
+    ))
+    for fname in sorted(matched):
+        print("  {:<55} {}".format(fname, matched[fname]))
     print()
 
 # ---------------------------------------------------------------------------
@@ -1096,6 +1118,8 @@ if __name__ == "__main__":
     print()
     print("Commands:")
     print("  list       show all indexed papers")
+    print("  list                   filter by name (substring)")
+    print("  list *                 filter by name (wildcard)")
     print("  model      switch Claude model interactively")
     print("  history    show conversation history")
     print("  clear      clear conversation history")
@@ -1118,8 +1142,10 @@ if __name__ == "__main__":
         if cmd == "quit":
             break
 
-        if cmd == "list":
-            list_papers(collection)
+     #   if cmd == "list":
+        if cmd.startswith("list"):
+            pattern = cmd[4:].strip() or None
+            list_papers(collection, pattern)
             continue
 
         if cmd == "history":
