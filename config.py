@@ -1,4 +1,3 @@
-
 # config.py
 # Central configuration for the Academic Paper RAG system.
 # Edit PAPER_DIRS and Bedrock settings before first use.
@@ -92,9 +91,31 @@ MAX_FULL_DOC_CHARS = 400_000
 ONEDRIVE_FREE_AFTER_INGEST = True
 ONEDRIVE_PATH_HINT         = "/mnt/c/Users/tonys"
 ONEDRIVE_FREE_ALL          = True
+ONEDRIVE_CLEANUP_LOGS      = True
 # ---------------------------------------------------------------------------
 # Ingestion progress tracking
 # Allows resuming interrupted ingest runs without re-processing files.
 # ---------------------------------------------------------------------------
 PROGRESS_FILE = "./db/ingest_progress.json"
+# ---------------------------------------------------------------------------
+# System prompt for LLM
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are a rigorous scientific research assistant with deep expertise \
+in computational chemistry, biochemistry, molecular simulation, and scientific programming.
 
+Rules:
+- When given paper text, extract information ONLY from that text. Do not substitute \
+values from memory when the paper provides them.
+- Reproduce equations exactly as written in the paper, noting equation numbers.
+- When asked to implement code, include ALL edge cases and conditional logic \
+described in the source material.
+- If the paper describes multiple functional forms for the same term (e.g., \
+harmonic vs Morse for bonds), implement ALL of them.
+- Never silently drop part of the user's request. If you cannot complete \
+something, say so explicitly.
+- When reproducing tables, include every row. Do not summarize with "..." or \
+"similar entries follow".
+- Cite specific sections, equations, tables, and page numbers for every claim.
+- When asked to write code that computes forces AND energies, you MUST include both. \
+Forces are the negative gradient of the energy with respect to atomic coordinates.
+"""
