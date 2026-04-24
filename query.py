@@ -6,7 +6,7 @@ query.py -- Interactive RAG query interface for academic papers.
 Retrieval modes
 ---------------
 Standard (default):
-    Two-stage retrieval -- SPECTER embeddings via HyDE -> top-N candidates ->
+    Two-stage retrieval -- embeddings via HyDE -> top-N candidates ->
     cross-encoder reranking -> best chunks sent to Claude.
 
 Full-document mode  (paper: prefix):
@@ -14,7 +14,7 @@ Full-document mode  (paper: prefix):
     and sent directly in the context window.
 
     Syntax:
-        paper:<filename>: 
+        paper:: 
         paper:,: 
         paper:: summarize
 """
@@ -84,12 +84,23 @@ def _normalize_meta(meta: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Conversation history
+# Token estimation
 # ---------------------------------------------------------------------------
+
+def estimate_tokens(text: str) -> int:
+    """Rough estimate: ~4 chars per token for English."""
+    return len(text) // 4
+
+
+# ---------------------------------------------------------------------------
+# Conversation history (multi-turn native messages)
+# ---------------------------------------------------------------------------
+
 class ConversationHistory:
-    def __init__(self, max_turns: int = 5):
-        self.turns:     list = []
-        self.max_turns: int  = max_turns
+    def __init__(self, max_turns: int = 8, max_answer_chars: int = 4000):
+        self.turns:            list = []
+        self.max_turns:        int  = max_turns
+        self.max_answer_chars: int  = max_answer_chars
 
     def add(self, question: str, answer: str):
         self.turns.append({"q": question, "a": answer})
@@ -99,15 +110,32 @@ class ConversationHistory:
     def clear(self):
         self.turns = []
 
+    def as_messages(self) -> list:
+        """Return history as alternating user/assistant message dicts."""
+        msgs = []
+        for t in self.turns:
+            msgs.append({"role": "user", "content": t["q"]})
+            a = t["a"]
+            if len(a) > self.max_answer_chars:
+                a = a[:self.max_answer_chars] + "\n[... truncated ...]"
+            msgs.append({"role": "assistant", "content": a})
+        return msgs
+
     def format_for_prompt(self) -> str:
+        """Legacy text-based format (used for display only)."""
         if not self.turns:
             return ""
         lines = ["CONVERSATION HISTORY (oldest first):"]
         for t in self.turns:
-            a_short = t["a"][:400] + "..." if len(t["a"]) > 400 else t["a"]
+            a = t["a"]
+            if len(a) > self.max_answer_chars:
+                a = a[:self.max_answer_chars] + "\n[... truncated ...]"
             lines.append("  Q: {}".format(t["q"]))
-            lines.append("  A: {}".format(a_short))
+            lines.append("  A: {}".format(a))
         return "\n".join(lines) + "\n\n"
+
+    def total_chars(self) -> int:
+        return sum(len(t["q"]) + len(t["a"]) for t in self.turns)
 
 
 # ---------------------------------------------------------------------------
@@ -155,16 +183,31 @@ def reset_bedrock_client():
 
 
 # ---------------------------------------------------------------------------
-# LLM invocation
+# LLM invocation (multi-turn native)
 # ---------------------------------------------------------------------------
 
-def _invoke(prompt: str, max_tokens: int = 4096) -> str | None:
+def _invoke_multiturn(messages: list, system: str = None,
+                      max_tokens: int = 4096) -> str | None:
+    """
+    Send a multi-turn conversation to Bedrock.
+
+    Parameters
+    ----------
+    messages : list of {"role": "user"|"assistant", "content": str}
+    system   : optional system prompt string
+    max_tokens : max output tokens
+    """
     client = _get_bedrock_client()
-    body   = json.dumps({
+
+    body_dict = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
-        "messages":   [{"role": "user", "content": prompt}],
-    })
+        "messages":   messages,
+    }
+    if system:
+        body_dict["system"] = system
+
+    body = json.dumps(body_dict)
 
     try:
         response = client.invoke_model(
@@ -188,18 +231,58 @@ def _invoke(prompt: str, max_tokens: int = 4096) -> str | None:
     return content[0]["text"]
 
 
-def ask_llm(prompt: str, max_tokens: int = 4096) -> str | None:
-    return _invoke(prompt, max_tokens=max_tokens)
+def _invoke(prompt: str, max_tokens: int = 4096,
+            system: str = None,
+            history: "ConversationHistory" = None) -> str | None:
+    """
+    Single-turn convenience wrapper.  If history is provided, builds a
+    proper multi-turn message list.
+    """
+    messages = []
+    if history:
+        messages = history.as_messages()
+    messages.append({"role": "user", "content": prompt})
+
+    sys_prompt = system or getattr(config, "SYSTEM_PROMPT", None)
+    return _invoke_multiturn(messages, system=sys_prompt, max_tokens=max_tokens)
 
 
-def ask_llm_general(question: str) -> str:
+def ask_llm(prompt: str, max_tokens: int = 4096,
+            history: "ConversationHistory" = None) -> str | None:
+    return _invoke(prompt, max_tokens=max_tokens, history=history)
+
+
+def ask_llm_general(question: str,
+                    history: "ConversationHistory" = None) -> str:
     prompt = (
-        "You are a helpful research assistant specialising in scientific literature.\n"
         "Answer the following question as clearly and accurately as you can.\n\n"
         "QUESTION:\n{}\n\nANSWER:".format(question)
     )
-    result = _invoke(prompt)
+    result = _invoke(prompt, history=history)
     return result if result else "Could not get a response from the model."
+
+
+# ---------------------------------------------------------------------------
+# Output verification
+# ---------------------------------------------------------------------------
+
+def verify_output(original_query: str, answer: str) -> str | None:
+    """Ask the model to self-check its own output for completeness."""
+    verify_prompt = (
+        "You previously answered this question:\n\n"
+        "QUESTION: {}\n\n"
+        "YOUR ANSWER (abbreviated):\n{}\n\n"
+        "Review your answer for:\n"
+        "1. Did you address EVERY part of the user's request?\n"
+        "2. Are all equations faithful to the source, or did you substitute "
+        "   familiar forms from memory?\n"
+        "3. Are any parameters, tables, or edge cases missing?\n"
+        "4. Are there any numerical values you stated without verifying "
+        "   against the paper?\n\n"
+        "List specific problems found. If none, say 'No issues found.'"
+    ).format(original_query, answer[:6000])
+
+    return _invoke(verify_prompt, max_tokens=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +407,6 @@ def build_fulldoc_prompt(query:    str,
 
     paper_block = "\n\n".join(doc_sections)
 
-    # FIX: use len(included) not len(papers)
     if len(included) == 1:
         paper_descriptor = "the paper '{}'".format(included[0])
     else:
@@ -351,7 +433,6 @@ def build_fulldoc_prompt(query:    str,
         ).format(paper_descriptor, query)
 
     instructions = (
-        "You are a research assistant performing deep analysis of academic papers.\n"
         "You have been given the COMPLETE TEXT of {} below.\n\n"
         "Important:\n"
         "  - Read the full text carefully before answering.\n"
@@ -363,15 +444,22 @@ def build_fulldoc_prompt(query:    str,
         "  - Do not rely on general knowledge when the answer is in the text.\n"
     ).format(paper_descriptor)
 
-    history_block = history.format_for_prompt() if history else ""
-
     prompt = (
-        "{}"
         "{}\n\n"
         "{}\n\n"
         "{}\n\n"
         "ANSWER:"
-    ).format(history_block, instructions, paper_block, task)
+    ).format(instructions, paper_block, task)
+
+    # Token budget warning
+    token_est   = estimate_tokens(prompt)
+    model_limit = 200_000
+    if token_est > model_limit * 0.9:
+        print(C.LABEL +
+              "  WARNING: prompt is ~{:,} tokens "
+              "({:.0%} of context window)".format(
+                  token_est, token_est / model_limit) +
+              C.RESET)
 
     return prompt, included, truncated
 
@@ -408,14 +496,24 @@ def ask_fulldoc(query:      str,
     print("  Sending {:,} chars (~{:,} tokens) to Claude...".format(
         char_count, char_count // 4))
 
-    answer = ask_llm(prompt, max_tokens=8192)
+    answer = ask_llm(prompt, max_tokens=8192, history=history)
 
     if answer is None:
         print("  Model refused or returned empty response.")
-        answer = ask_llm_general(query)
+        answer = ask_llm_general(query, history=history)
         print(C.ANSWER + "[Fallback to general knowledge]\n" + answer + C.RESET)
     else:
         print("\n" + C.ANSWER + answer + C.RESET)
+
+        # Self-verification for substantial outputs
+        if len(answer) > 2000:
+            print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
+            issues = verify_output(query, answer)
+            if issues and "no issues found" not in issues.lower():
+                print(C.LABEL + "  Self-check found potential issues:" + C.RESET)
+                print(C.DIM + issues + C.RESET)
+            else:
+                print(C.DIM + "  Self-check: no issues found." + C.RESET)
 
     print("\n=== SOURCE ===")
     print(C.LABEL + "  [Full-document mode -- complete PDF text sent to model]" + C.RESET)
@@ -437,7 +535,6 @@ def ask_fulldoc(query:      str,
 
 def hyde_query_embedding(query: str, embedder) -> list:
     hyde_prompt = (
-        "You are a scientific search assistant.\n"
         "Given the user's question, generate a short academic paper TITLE and "
         "ABSTRACT (3-4 sentences) that would answer this question.\n"
         "Write ONLY the title and abstract — no labels, no preamble.\n\n"
@@ -463,7 +560,6 @@ def hyde_query_embedding(query: str, embedder) -> list:
 def expand_query(query: str) -> str:
     """Ask the LLM to expand acronyms and clarify ambiguous terms."""
     prompt = (
-        "You are a scientific search query optimizer.\n"
         "Expand all acronyms and rewrite the following query as a precise "
         "scientific search query. Keep it under 30 words.\n"
         "Write ONLY the rewritten query — nothing else.\n\n"
@@ -609,8 +705,7 @@ def web_search(query: str, n_results: int = 3) -> tuple:
 
 def build_rag_prompt(query:       str,
                      rag_results: dict,
-                     web_results: list = None,
-                     history:     ConversationHistory = None) -> str:
+                     web_results: list = None) -> str:
     paper_parts = []
     for i, (doc, meta) in enumerate(zip(
         rag_results["documents"][0],
@@ -637,8 +732,6 @@ def build_rag_prompt(query:       str,
 
     if web_context:
         instructions = (
-            "You are a research assistant with access to the user's papers "
-            "and live web search results.\n\n"
             "Rules:\n"
             "  1. Answer primarily from PAPER CONTEXT where relevant.\n"
             "  2. Use WEB CONTEXT to supplement or add up-to-date information.\n"
@@ -655,8 +748,6 @@ def build_rag_prompt(query:       str,
         ).format(paper_context, web_context)
     else:
         instructions = (
-            "You are a research assistant helping a scientist understand "
-            "their own papers.\n\n"
             "Rules:\n"
             "  1. Answer primarily from PAPER CONTEXT where relevant.\n"
             "  2. Supplement with general knowledge where needed and label it:\n"
@@ -669,15 +760,12 @@ def build_rag_prompt(query:       str,
             "PAPER CONTEXT (retrieved chunks from the user's documents):\n{}"
         ).format(paper_context)
 
-    history_block = history.format_for_prompt() if history else ""
-
     return (
-        "{}"
         "{}\n\n"
         "{}\n\n"
         "QUESTION:\n{}\n\n"
         "ANSWER:"
-    ).format(history_block, instructions, context_block, query)
+    ).format(instructions, context_block, query)
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +831,7 @@ def ask(query:           str,
     # Early exit if no relevant chunks survived reranking
     if not rag_results["documents"][0]:
         print("  No relevant chunks found (all below rerank threshold).")
-        answer = ask_llm_general(query)
+        answer = ask_llm_general(query, history=history)
         print(C.ANSWER +
               "[Not found in papers -- answering from general knowledge]\n" +
               answer + C.RESET)
@@ -763,12 +851,12 @@ def ask(query:           str,
         else:
             print("  No web results returned.")
 
-    prompt = build_rag_prompt(query, rag_results, web_results or None, history)
-    answer = ask_llm(prompt)
+    prompt = build_rag_prompt(query, rag_results, web_results or None)
+    answer = ask_llm(prompt, history=history)
 
     if answer is None:
         print("\n  [Model refused context -- retrying as general question]")
-        answer = ask_llm_general(query)
+        answer = ask_llm_general(query, history=history)
         print(C.ANSWER +
               "[Not found in papers -- answering from general knowledge]\n" +
               answer + C.RESET)
@@ -834,10 +922,9 @@ def summarize_paper(target:    str,
             "  4. The conclusions and broader implications"
         ),
         rag_results = rag_results,
-        history     = history,
     )
 
-    answer = ask_llm(prompt)
+    answer = ask_llm(prompt, history=history)
     if answer:
         print("\n" + C.ANSWER + answer + C.RESET)
         _display_rag_sources(rag_results, [], "none")
@@ -977,7 +1064,7 @@ def parse_query(raw: str) -> tuple:
 
 if __name__ == "__main__":
     embedder, reranker, collection = load_resources()
-    history = ConversationHistory(max_turns=5)
+    history = ConversationHistory(max_turns=8, max_answer_chars=4000)
 
     web_status = "on" if getattr(config, "WEB_SEARCH_ENABLED", False) else "off"
 
@@ -993,18 +1080,19 @@ if __name__ == "__main__":
         getattr(config, "RERANK_THRESHOLD", 0.0)))
     print("  Web search   : {} (toggle: webon / weboff)".format(web_status))
     print("  Chunks in DB : {}".format(collection.count()))
+    print("  Verify mode  : on (auto self-check for long outputs)")
     print("=" * 62)
     print()
     print("Query prefixes:")
-    print("  paper::    deep analysis -- full PDF sent to model")
-    print("  paper:,:     deep analysis of multiple papers")
-    print("  paper:: summarize    deep summary of one paper")
-    print("  methods:                       search only methods sections")
-    print("  results:                       search only results sections")
-    print("  folder::                 search only that topic folder")
-    print("  web:                           force web search for this query")
-    print("  summarize:           RAG-based summary (chunk retrieval)")
-    print("  summarize:all                  RAG-based summary across all papers")
+    print("  paper::     deep analysis -- full PDF sent to model")
+    print("  paper:,:  deep analysis of multiple papers")
+    print("  paper:: summarize     deep summary of one paper")
+    print("  methods:          search only methods sections")
+    print("  results:          search only results sections")
+    print("  folder::    search only that topic folder")
+    print("  web:              force web search for this query")
+    print("  summarize:        RAG-based summary (chunk retrieval)")
+    print("  summarize:all               RAG-based summary across all papers")
     print()
     print("Commands:")
     print("  list       show all indexed papers")
