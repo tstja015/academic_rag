@@ -69,6 +69,11 @@ def get_file_size_mb(path):
         return 0.0
 
 def cleanup_onedrive_logs():
+    """
+    Delete accumulated OneDrive .odl log files that can grow to hundreds of GB.
+    Safe to call at any time -- OneDrive recreates logs as needed.
+    Uses PowerShell natively from WSL to avoid slow /mnt/c rglob.
+    """
     if not getattr(config, "ONEDRIVE_CLEANUP_LOGS", True):
         return
     if not IS_WSL and not IS_WINDOWS:
