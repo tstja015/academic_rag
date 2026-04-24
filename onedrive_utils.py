@@ -69,43 +69,39 @@ def get_file_size_mb(path):
         return 0.0
 
 def cleanup_onedrive_logs():
-    """
-    Delete accumulated OneDrive .odl log files that can grow to hundreds of GB.
-    Safe to call at any time -- OneDrive recreates logs as needed.
-    Works from WSL (via /mnt/c) or native Windows.
-    """
-    if IS_WSL:
-        # Build path via /mnt/c
-        local_app_data = "/mnt/c/Users"
-        # Try to find the username from the ONEDRIVE_PATH_HINT
-        hint = getattr(config, "ONEDRIVE_PATH_HINT", "")
-        # hint is like /mnt/c/Users/tonys
-        hint_path = Path(hint)
-        username = hint_path.name  # "tonys"
-        log_dir = Path(f"/mnt/c/Users/{username}/AppData/Local/Microsoft/OneDrive/logs")
-    else:
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        log_dir = Path(local_app_data) / "Microsoft" / "OneDrive" / "logs"
-
-    if not log_dir.exists():
-        log.debug("OneDrive log dir not found, skipping cleanup: %s", log_dir)
+    if not getattr(config, "ONEDRIVE_CLEANUP_LOGS", True):
+        return
+    if not IS_WSL and not IS_WINDOWS:
         return
 
-    deleted = 0
-    freed_mb = 0.0
-    for f in log_dir.rglob("*.odl"):
-        try:
-            freed_mb += f.stat().st_size / 1_048_576
-            f.unlink()
-            deleted += 1
-        except Exception as e:
-            log.debug("Could not delete log file %s: %s", f, e)
+    try:
+        if IS_WSL:
+            r = subprocess.run(
+                ["powershell.exe", "-Command",
+                 "Remove-Item '$env:LOCALAPPDATA\\Microsoft\\OneDrive\\logs\\*.odl' "
+                 "-Recurse -Force -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            # Native Windows
+            log_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                   "Microsoft", "OneDrive", "logs")
+            r = subprocess.run(
+                ["powershell.exe", "-Command",
+                 f"Remove-Item '{log_dir}\\*.odl' -Recurse -Force "
+                 "-ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=30,
+            )
 
-    if deleted:
-        log.info("OneDrive log cleanup: deleted %d files, freed %.1f MB",
-                 deleted, freed_mb)
-    else:
-        log.debug("OneDrive log cleanup: nothing to delete.")
+        if r.returncode == 0:
+            log.info("OneDrive log cleanup: completed via PowerShell")
+        else:
+            log.debug("OneDrive log cleanup: powershell returned %d", r.returncode)
+
+    except subprocess.TimeoutExpired:
+        log.warning("OneDrive log cleanup: timed out after 30s")
+    except Exception as e:
+        log.debug("OneDrive log cleanup failed: %s", e)
 
 def free_onedrive_file(path):
     if not getattr(config, "ONEDRIVE_FREE_AFTER_INGEST", False):

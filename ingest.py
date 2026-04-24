@@ -578,7 +578,6 @@ def build_path_index(all_pdfs: list, completed_set: set,
 # Main
 # ---------------------------------------------------------------------------
 
-```python
 def main():
     # -- Argument parsing ---------------------------------------------------
     parser = argparse.ArgumentParser(description="Ingest academic PDFs into ChromaDB")

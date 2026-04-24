@@ -14,6 +14,15 @@ PAPER_DIRS = [
     "/home/ans000/doc/MeOH_FalDH",
     "/home/ans000/doc/MeOH_FDH",
     "/home/ans000/doc/papers",
+    "/home/ans000/doc/copper_nanowire",
+    "/home/ans000/doc/FAS",
+    "/home/ans000/doc/GOx",
+    "/home/ans000/doc/H2O2 project",
+    "/home/ans000/doc/MeOH_unclear",
+    "/home/ans000/doc/Methane_monooxygenase",
+    "/home/ans000/doc/Nanowire",
+    "/home/ans000/doc/Nitrogenase",
+    "/home/ans000/doc/Procedures",
     # "/path/to/more/papers",
 ]
 # ---------------------------------------------------------------------------

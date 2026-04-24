@@ -1,0 +1,226 @@
+
+The filter is placed before load_progress() in your paste, but that's fine — the only issue worth flagging is the one already mentioned: make sure the orphan cleanup guard is in place.
+
+Here is the correct final ordering of all the pieces in main() so nothing is out of sequence:
+
+def main():
+    # -- Argument parsing ---------------------------------------------------
+    parser = argparse.ArgumentParser(description="Ingest academic PDFs into ChromaDB")
+    parser.add_argument(
+        "--dir",
+        metavar="DIR",
+        default=None,
+        help="If specified, only ingest PDFs under this directory.",
+    )
+    args = parser.parse_args()
+
+    filter_dir = os.path.abspath(args.dir) if args.dir else None
+
+    if filter_dir and not os.path.isdir(filter_dir):
+        log.error("--dir does not exist or is not a directory: %s", filter_dir)
+        sys.exit(1)
+
+    # -- ChromaDB -----------------------------------------------------------
+    os.makedirs(config.DB_DIR, exist_ok=True)
+    client = chromadb.PersistentClient(
+        path     = config.DB_DIR,
+        settings = Settings(anonymized_telemetry=False),
+    )
+    collection = client.get_or_create_collection(
+        name     = config.COLLECTION_NAME,
+        metadata = {"hnsw:space": "cosine"},
+    )
+    log.info(
+        "Collection '%s' has %d existing chunks",
+        config.COLLECTION_NAME, collection.count(),
+    )
+
+    # -- embedding model ----------------------------------------------------
+    log.info("Loading embedding model: %s", config.EMBED_MODEL)
+    embed_model = SentenceTransformer(config.EMBED_MODEL)
+
+    # -- collect files ------------------------------------------------------
+    all_pdfs = collect_pdfs()
+    if not all_pdfs:
+        log.error("No PDFs found. Check PAPER_DIRS in config.py")
+        sys.exit(1)
+
+    # -- Filter to specified directory if provided -------------------------
+    if filter_dir:
+        all_pdfs = [
+            p for p in all_pdfs
+            if os.path.abspath(p).startswith(filter_dir + os.sep)
+        ]
+        log.info(
+            "Filtering to --dir: %s  →  %d PDF(s) found",
+            filter_dir, len(all_pdfs),
+        )
+        if not all_pdfs:
+            log.error(
+                "No PDFs found under --dir: %s  "
+                "(check that the path is under a configured PAPER_DIR)",
+                filter_dir,
+            )
+            sys.exit(1)
+
+    # -- load resume state --------------------------------------------------
+    progress      = load_progress()
+    completed_set = set(progress["completed"])      # set of hashes
+    path_index    = progress.get("path_index", {})  # {abs_path -> hash}
+    log.info(
+        "Already completed: %d files  |  path index: %d entries",
+        len(completed_set), len(path_index),
+    )
+
+    # -- clean OneDrive logs before starting --------------------------------
+    log.info("Cleaning OneDrive logs before ingest...")
+    cleanup_onedrive_logs()
+
+    # -- report starting disk space -----------------------------------------
+    log_drive_free_space("C")
+
+    # -- build path index ---------------------------------------------------
+    build_path_index(all_pdfs, completed_set, path_index, progress)
+
+    # -- partition: fast-skip vs needs-check --------------------------------
+    fast_skip   = []
+    needs_check = []
+
+    for pdf_path in all_pdfs:
+        abs_path    = os.path.abspath(pdf_path)
+        stored_hash = path_index.get(abs_path)
+        if stored_hash and stored_hash in completed_set:
+            fast_skip.append(pdf_path)
+        else:
+            needs_check.append(pdf_path)
+
+    log.info(
+        "Fast-skip: %d files  |  Need checking: %d files",
+        len(fast_skip), len(needs_check),
+    )
+
+    # -- bulk-free fast-skip OneDrive files ---------------------------------
+    freed_mb = 0.0
+    if fast_skip:
+        log.info(
+            "Releasing %d already-ingested OneDrive files (bulk)...",
+            len(fast_skip),
+        )
+        bulk = free_onedrive_files_bulk(fast_skip)
+        freed_mb += bulk["mb_reclaimed"]
+        log.info(
+            "  Bulk free: freed=%d  skipped=%d  reclaimed=%.1f MB",
+            bulk["freed"], bulk["skipped"], bulk["mb_reclaimed"],
+        )
+
+    # -- live hashes for orphan cleanup ------------------------------------
+    live_hashes: set = {
+        path_index[os.path.abspath(p)]
+        for p in fast_skip
+        if os.path.abspath(p) in path_index
+    }
+
+    # -- stats -------------------------------------------------------------
+    stats = {
+        "ingested":       0,
+        "skipped":        0,
+        "metadata_fixed": 0,
+        "failed":         0,
+        "freed_mb":       freed_mb,
+    }
+
+    # -- main ingest loop --------------------------------------------------
+    for i, pdf_path in enumerate(tqdm(needs_check, desc="Ingesting papers")):
+
+        abs_path = os.path.abspath(pdf_path)
+
+        try:
+            fhash = file_hash(pdf_path)
+        except OSError as e:
+            log.warning("Cannot read %s: %s", pdf_path, e)
+            stats["failed"] += 1
+            continue
+
+        live_hashes.add(fhash)
+
+        if fhash in completed_set:
+            status = check_and_update_metadata(fhash, pdf_path, collection)
+
+            if status == "match":
+                path_index[abs_path] = fhash
+                progress["path_index"] = path_index
+                save_progress(progress)
+                stats["skipped"] += 1
+                free_onedrive_file(pdf_path)
+                continue
+
+            elif status == "error":
+                stats["skipped"] += 1
+                free_onedrive_file(pdf_path)
+                continue
+
+            elif status == "updated":
+                path_index[abs_path] = fhash
+                progress["path_index"] = path_index
+                save_progress(progress)
+                stats["metadata_fixed"] += 1
+                free_onedrive_file(pdf_path)
+                continue
+
+        if pdf_path in progress.get("failed", {}):
+            log.debug("Previously failed, skipping: %s", Path(pdf_path).name)
+            stats["skipped"] += 1
+            free_onedrive_file(pdf_path)
+            continue
+
+        try:
+            ingest_one(pdf_path, collection, embed_model, fhash)
+
+            if fhash not in completed_set:
+                progress["completed"].append(fhash)
+                completed_set.add(fhash)
+
+            path_index[abs_path] = fhash
+            progress["path_index"] = path_index
+            save_progress(progress)
+            stats["ingested"] += 1
+
+            mb = get_file_size_mb(pdf_path)
+            if free_onedrive_file(pdf_path):
+                stats["freed_mb"] += mb
+
+        except Exception as e:
+            log.error("Error processing %s: %s", Path(pdf_path).name, e)
+            progress.setdefault("failed", {})[pdf_path] = str(e)
+            save_progress(progress)
+            stats["failed"] += 1
+            free_onedrive_file(pdf_path)
+
+        if i > 0 and i % 50 == 0:
+            log_drive_free_space("C")
+            cleanup_onedrive_logs()
+
+    # -- orphan cleanup (skipped for scoped runs) --------------------------
+    if filter_dir:
+        log.info(
+            "Skipping orphan cleanup -- scoped run via --dir does not "
+            "have visibility into all files."
+        )
+        orphans_removed = 0
+    else:
+        orphans_removed = cleanup_orphans(collection, live_hashes, progress)
+
+    # -- final OneDrive log cleanup ----------------------------------------
+    log.info("Final OneDrive log cleanup...")
+    cleanup_onedrive_logs()
+
+    # -- final report ------------------------------------------------------
+    log_drive_free_space("C")
+    log.info(
+        "Done.  ingested=%d  metadata_fixed=%d  skipped=%d  "
+        "failed=%d  orphans_removed=%d  freed=%.1f MB",
+        stats["ingested"], stats["metadata_fixed"],
+        stats["skipped"], stats["failed"],
+        orphans_removed, stats["freed_mb"],
+    )
+    log.info("Total chunks in collection: %d", collection.count())
