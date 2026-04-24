@@ -1,4 +1,3 @@
-
 # ingest.py
 """
 Ingest academic PDFs into ChromaDB with:
@@ -9,6 +8,7 @@ Ingest academic PDFs into ChromaDB with:
   - Orphan cleanup (removes chunks whose source PDFs no longer exist)
   - Per-file error isolation (one bad PDF won't kill the run)
   - Section detection for chunk metadata
+  - Table-aware chunking (keeps tables as atomic units)
   - OneDrive eviction after each successful ingest (WSL-aware)
   - OneDrive log cleanup at start, periodically, and at end
   - Periodic disk space reporting
@@ -192,25 +192,49 @@ def extract_folder(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# Chunking (table-aware)
 # ---------------------------------------------------------------------------
 
 def chunk_text(text: str) -> list:
-    sentences   = re.split(r'(?<=[.!?])\s+', text)
-    chunks      = []
-    current     = []
+    """
+    Split text into chunks respecting sentence boundaries.
+    Tables and figures are kept as atomic units when possible.
+    """
+    # Split into structural blocks -- tables/figures get their own block
+    blocks = re.split(r'\n(?=(?:Table|Figure|Equation)\s+\d)', text)
+
+    chunks    = []
+    current   = []
     current_len = 0
 
-    for sent in sentences:
-        words = sent.split()
-        if current_len + len(words) > config.CHUNK_SIZE and current:
-            chunks.append(" ".join(current))
-            overlap_words = " ".join(current).split()[-config.CHUNK_OVERLAP:]
-            current     = overlap_words + words
-            current_len = len(current)
-        else:
-            current.extend(words)
-            current_len += len(words)
+    for block in blocks:
+        words = block.split()
+
+        # Keep tables/figures as atomic units (don't split mid-table)
+        is_table = bool(re.match(r'(?:Table|Figure)\s+\d', block[:50]))
+
+        if is_table and len(words) < config.CHUNK_SIZE * 2:
+            # Flush current chunk
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            # Table gets its own chunk
+            chunks.append(block)
+            continue
+
+        # Normal sentence-based chunking for prose
+        sentences = re.split(r'(?<=[.!?])\s+', block)
+        for sent in sentences:
+            sent_words = sent.split()
+            if current_len + len(sent_words) > config.CHUNK_SIZE and current:
+                chunks.append(" ".join(current))
+                overlap_words = " ".join(current).split()[-config.CHUNK_OVERLAP:]
+                current     = overlap_words + sent_words
+                current_len = len(current)
+            else:
+                current.extend(sent_words)
+                current_len += len(sent_words)
 
     if current:
         chunks.append(" ".join(current))
@@ -326,33 +350,33 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
     file_size_mb  = os.path.getsize(path) / (1024 * 1024)
     avg_chunk_len = sum(len(c.split()) for c in chunks) / len(chunks)
 
-    # -- Embed and store ----------------------------------------------------
-    batch_size = 32
-    for i in range(0, len(chunks), batch_size):
-        batch      = chunks[i:i + batch_size]
-        embeddings = embed_model.encode(
-            batch, show_progress_bar=False
-        ).tolist()
+    # -- Embed all chunks in one GPU call -----------------------------------
+    all_embeddings = embed_model.encode(
+        chunks,
+        show_progress_bar=False,
+        batch_size=256,
+    ).tolist()
 
-        ids       = [f"{fhash}_{i + j}" for j in range(len(batch))]
-        metadatas = [
-            {
-                "filename":     filename,
-                "full_path":    os.path.abspath(path),
-                "folder":       folder,
-                "section":      detect_section(batch[j]),
-                "chunk_index":  i + j,
-                "total_chunks": len(chunks),
-                "file_hash":    fhash,
-            }
-            for j in range(len(batch))
-        ]
-
+    # -- Store in ChromaDB --------------------------------------------------
+    db_batch = 5000
+    for i in range(0, len(chunks), db_batch):
+        end = min(i + db_batch, len(chunks))
         collection.add(
-            ids        = ids,
-            documents  = batch,
-            embeddings = embeddings,
-            metadatas  = metadatas,
+            ids        = [f"{fhash}_{j}" for j in range(i, end)],
+            documents  = chunks[i:end],
+            embeddings = all_embeddings[i:end],
+            metadatas  = [
+                {
+                    "filename":     filename,
+                    "full_path":    os.path.abspath(path),
+                    "folder":       folder,
+                    "section":      detect_section(chunks[j]),
+                    "chunk_index":  j,
+                    "total_chunks": len(chunks),
+                    "file_hash":    fhash,
+                }
+                for j in range(i, end)
+            ],
         )
 
     # -- Section breakdown --------------------------------------------------
