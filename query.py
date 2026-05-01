@@ -520,11 +520,23 @@ def ask_llm_general(question: str,
 # Output verification
 # ---------------------------------------------------------------------------
 
-def verify_output(original_query: str, answer: str) -> str | None:
+def verify_output(original_query: str,
+                  answer:         str,
+                  context:        str = None) -> str | None:
+
+    context_block = ""
+    if context:
+        # Trim to avoid blowing the context window on verification
+        trimmed = context[:40_000]
+        context_block = (
+            "\n\nSOURCE MATERIAL (use this to verify claims):\n"
+            + trimmed
+        )
     verify_prompt = (
         "You previously answered this question:\n\n"
         "QUESTION: {}\n\n"
         "YOUR ANSWER (abbreviated):\n{}\n\n"
+        "{}"
         "Review your answer for:\n"
         "1. Did you address EVERY part of the user's request?\n"
         "2. Are all equations faithful to the source, or did you substitute "
@@ -533,9 +545,8 @@ def verify_output(original_query: str, answer: str) -> str | None:
         "4. Are there any numerical values you stated without verifying "
         "   against the paper?\n\n"
         "List specific problems found. If none, say 'No issues found.'"
-    ).format(original_query, answer[:6000])
+    ).format(original_query, answer[:6000], context_block)
     return _invoke(verify_prompt, max_tokens=2000)
-
 
 # ---------------------------------------------------------------------------
 # Full-document mode
@@ -853,14 +864,43 @@ def ask_fulldoc(query:       str,
               answer + C.RESET)
     else:
         print("\n" + C.ANSWER + answer + C.RESET)
-
+        
+        # Build context from the full paper text already in memory
+        verify_context = "\n\n".join(
+            "{}:\n{}".format(fname, text[:20_000])
+            for fname, text in papers_text
+        )
+        
         if len(answer) > 2000:
             print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
-            issues = verify_output(query, answer)
+            issues = verify_output(query, answer, context=verify_context)
             if issues and "no issues found" not in issues.lower():
                 print(C.LABEL +
                       "  Self-check found potential issues:" + C.RESET)
                 print(C.DIM + issues + C.RESET)
+
+                # Auto-correction pass
+                print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
+                correction_prompt = (
+                    "You previously answered this question:\n\n"
+                    "QUESTION: {}\n\n"
+                    "YOUR ANSWER:\n{}\n\n"
+                    "A self-review identified these specific problems:\n{}\n\n"
+                    "Please rewrite the answer with all of these problems fixed.\n"
+                    "Keep everything that was correct. Only fix what was flagged.\n"
+                    "Do not add a preamble explaining what you changed -- "
+                    "just give the corrected answer directly."
+                ).format(query, answer, issues)
+
+                corrected = _invoke(correction_prompt, max_tokens=8192)
+                if corrected:
+                    print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
+                    print(C.ANSWER + corrected + C.RESET)
+                    answer = corrected  # replace answer in history with corrected version
+                else:
+                    print(C.LABEL +
+                          "  Auto-correction failed -- keeping original answer." +
+                          C.RESET)
             else:
                 print(C.DIM + "  Self-check: no issues found." + C.RESET)
 
@@ -1203,13 +1243,52 @@ def ask(query:           str,
         print("  (none -- general knowledge fallback)")
     else:
         print("\n" + C.ANSWER + answer + C.RESET)
+
+        verify_context = (
+            "\n\n".join(rag_results["documents"][0])
+            if rag_results["documents"][0]
+            else None
+        )
+
+        if len(answer) > 2000:
+            print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
+            issues = verify_output(query, answer, context=verify_context)
+            if issues and "no issues found" not in issues.lower():
+                print(C.LABEL +
+                      "  Self-check found potential issues:" + C.RESET)
+                print(C.DIM + issues + C.RESET)
+
+                # Auto-correction pass
+                print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
+                correction_prompt = (
+                    "You previously answered this question:\n\n"
+                    "QUESTION: {}\n\n"
+                    "YOUR ANSWER:\n{}\n\n"
+                    "A self-review identified these specific problems:\n{}\n\n"
+                    "Please rewrite the answer with all of these problems fixed.\n"
+                    "Keep everything that was correct. Only fix what was flagged.\n"
+                    "Do not add a preamble explaining what you changed -- "
+                    "just give the corrected answer directly."
+                ).format(query, answer, issues)
+
+                corrected = _invoke(correction_prompt, max_tokens=8192)
+                if corrected:
+                    print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
+                    print(C.ANSWER + corrected + C.RESET)
+                    answer = corrected
+                else:
+                    print(C.LABEL +
+                          "  Auto-correction failed -- keeping original answer." +
+                          C.RESET)
+            else:
+                print(C.DIM + "  Self-check: no issues found." + C.RESET)
+
         _display_rag_sources(rag_results, web_results, search_engine)
 
     if history and answer:
         history.add(query, answer)
 
     return answer
-
 
 # ---------------------------------------------------------------------------
 # Summarize via RAG
@@ -1651,34 +1730,38 @@ if __name__ == "__main__":
          summarize_target,
          paper_tokens) = parse_query(raw)
 
-        if paper_tokens is not None:
-            paper_tokens = expand_paper_tokens(paper_tokens, collection)
-            ask_fulldoc(
-                query       = query,
-                name_tokens = paper_tokens,
-                collection  = collection,
-                history     = history,
-            )
+        try:
+            if paper_tokens is not None:
+                paper_tokens = expand_paper_tokens(paper_tokens, collection)
+                ask_fulldoc(
+                    query       = query,
+                    name_tokens = paper_tokens,
+                    collection  = collection,
+                    history     = history,
+                )
 
-        elif summarize_target is not None:
-            summarize_paper(
-                target     = summarize_target,
-                embedder   = embedder,
-                reranker   = reranker,
-                collection = collection,
-                history    = history,
-            )
+            elif summarize_target is not None:
+                summarize_paper(
+                    target     = summarize_target,
+                    embedder   = embedder,
+                    reranker   = reranker,
+                    collection = collection,
+                    history    = history,
+                )
 
-        else:
-            ask(
-                query          = query,
-                embedder       = embedder,
-                reranker       = reranker,
-                collection     = collection,
-                history        = history,
-                section_filter = section_filter,
-                folder_filter  = folder_filter,
-                force_web      = force_web,
-            )
+            else:
+                ask(
+                    query          = query,
+                    embedder       = embedder,
+                    reranker       = reranker,
+                    collection     = collection,
+                    history        = history,
+                    section_filter = section_filter,
+                    folder_filter  = folder_filter,
+                    force_web      = force_web,
+                )
+
+        except KeyboardInterrupt:
+            print(C.LABEL + "\n  Query cancelled." + C.RESET)
 
         print()
