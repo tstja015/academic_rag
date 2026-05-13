@@ -871,38 +871,38 @@ def ask_fulldoc(query:       str,
             for fname, text in papers_text
         )
         
-        if len(answer) > 2000:
-            print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
-            issues = verify_output(query, answer, context=verify_context)
-            if issues and "no issues found" not in issues.lower():
-                print(C.LABEL +
-                      "  Self-check found potential issues:" + C.RESET)
-                print(C.DIM + issues + C.RESET)
+        #if len(answer) > 2000:
+        print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
+        issues = verify_output(query, answer, context=verify_context)
+        if issues and "no issues found" not in issues.lower():
+            print(C.LABEL +
+                  "  Self-check found potential issues:" + C.RESET)
+            print(C.DIM + issues + C.RESET)
 
-                # Auto-correction pass
-                print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
-                correction_prompt = (
-                    "You previously answered this question:\n\n"
-                    "QUESTION: {}\n\n"
-                    "YOUR ANSWER:\n{}\n\n"
-                    "A self-review identified these specific problems:\n{}\n\n"
-                    "Please rewrite the answer with all of these problems fixed.\n"
-                    "Keep everything that was correct. Only fix what was flagged.\n"
-                    "Do not add a preamble explaining what you changed -- "
-                    "just give the corrected answer directly."
-                ).format(query, answer, issues)
+            # Auto-correction pass
+            print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
+            correction_prompt = (
+                "You previously answered this question:\n\n"
+                "QUESTION: {}\n\n"
+                "YOUR ANSWER:\n{}\n\n"
+                "A self-review identified these specific problems:\n{}\n\n"
+                "Please rewrite the answer with all of these problems fixed.\n"
+                "Keep everything that was correct. Only fix what was flagged.\n"
+                "Do not add a preamble explaining what you changed -- "
+                "just give the corrected answer directly."
+            ).format(query, answer, issues)
 
-                corrected = _invoke(correction_prompt, max_tokens=8192)
-                if corrected:
-                    print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
-                    print(C.ANSWER + corrected + C.RESET)
-                    answer = corrected  # replace answer in history with corrected version
-                else:
-                    print(C.LABEL +
-                          "  Auto-correction failed -- keeping original answer." +
-                          C.RESET)
+            corrected = _invoke(correction_prompt, max_tokens=8192)
+            if corrected:
+                print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
+                print(C.ANSWER + corrected + C.RESET)
+                answer = corrected  # replace answer in history with corrected version
             else:
-                print(C.DIM + "  Self-check: no issues found." + C.RESET)
+                print(C.LABEL +
+                      "  Auto-correction failed -- keeping original answer." +
+                      C.RESET)
+        else:
+            print(C.DIM + "  Self-check: no issues found." + C.RESET)
 
     print("\n=== SOURCE ===")
     print(C.LABEL +
@@ -1250,38 +1250,38 @@ def ask(query:           str,
             else None
         )
 
-        if len(answer) > 2000:
-            print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
-            issues = verify_output(query, answer, context=verify_context)
-            if issues and "no issues found" not in issues.lower():
-                print(C.LABEL +
-                      "  Self-check found potential issues:" + C.RESET)
-                print(C.DIM + issues + C.RESET)
+        #if len(answer) > 2000:
+        print(C.LABEL + "\n  [Running self-verification...]" + C.RESET)
+        issues = verify_output(query, answer, context=verify_context)
+        if issues and "no issues found" not in issues.lower():
+            print(C.LABEL +
+                  "  Self-check found potential issues:" + C.RESET)
+            print(C.DIM + issues + C.RESET)
 
-                # Auto-correction pass
-                print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
-                correction_prompt = (
-                    "You previously answered this question:\n\n"
-                    "QUESTION: {}\n\n"
-                    "YOUR ANSWER:\n{}\n\n"
-                    "A self-review identified these specific problems:\n{}\n\n"
-                    "Please rewrite the answer with all of these problems fixed.\n"
-                    "Keep everything that was correct. Only fix what was flagged.\n"
-                    "Do not add a preamble explaining what you changed -- "
-                    "just give the corrected answer directly."
-                ).format(query, answer, issues)
+            # Auto-correction pass
+            print(C.LABEL + "\n  [Running auto-correction...]" + C.RESET)
+            correction_prompt = (
+                "You previously answered this question:\n\n"
+                "QUESTION: {}\n\n"
+                "YOUR ANSWER:\n{}\n\n"
+                "A self-review identified these specific problems:\n{}\n\n"
+                "Please rewrite the answer with all of these problems fixed.\n"
+                "Keep everything that was correct. Only fix what was flagged.\n"
+                "Do not add a preamble explaining what you changed -- "
+                "just give the corrected answer directly."
+            ).format(query, answer, issues)
 
-                corrected = _invoke(correction_prompt, max_tokens=8192)
-                if corrected:
-                    print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
-                    print(C.ANSWER + corrected + C.RESET)
-                    answer = corrected
-                else:
-                    print(C.LABEL +
-                          "  Auto-correction failed -- keeping original answer." +
-                          C.RESET)
+            corrected = _invoke(correction_prompt, max_tokens=8192)
+            if corrected:
+                print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
+                print(C.ANSWER + corrected + C.RESET)
+                answer = corrected
             else:
-                print(C.DIM + "  Self-check: no issues found." + C.RESET)
+                print(C.LABEL +
+                      "  Auto-correction failed -- keeping original answer." +
+                      C.RESET)
+        else:
+            print(C.DIM + "  Self-check: no issues found." + C.RESET)
 
         _display_rag_sources(rag_results, web_results, search_engine)
 
@@ -1632,27 +1632,27 @@ if __name__ == "__main__":
     print("=" * 62)
     print()
     print("Query prefixes:")
-    print("  paper::        full PDF sent to model")
-    print("  paper:,:     multiple papers")
-    print("  paper:: summarize     deep summary")
-    print("  methods:             search only methods sections")
-    print("  results:             search only results sections")
-    print("  folder::       search only that topic folder")
-    print("  web:                 force web search for this query")
-    print("  summarize:            RAG-based summary (chunk retrieval)")
-    print("  summarize:all               RAG-based summary across all papers")
+    print("  paper:<name>:                 full PDF sent to model")
+    print("  paper:,:              multiple papers")
+    print("  paper:: summarize       deep summary")
+    print("  methods:               search only methods sections")
+    print("  results:               search only results sections")
+    print("  folder::         search only that topic folder")
+    print("  web:                   force web search for this query")
+    print("  summarize:              RAG-based summary (chunk retrieval)")
+    print("  summarize:all                 RAG-based summary across all papers")
     print()
     print("Commands:")
-    print("  list                        show all indexed papers")
-    print("  list               filter by name (substring or wildcard)")
-    print("  model                       switch model interactively")
-    print("  backend                     show current backend")
-    print("  backend:bedrock             switch to AWS Bedrock")
-    print("  backend:ollama              switch to local Ollama")
-    print("  history                     show conversation history")
-    print("  clear                       clear conversation history")
-    print("  webon / weboff              toggle web search globally")
-    print("  quit                        exit")
+    print("  list                          show all indexed papers")
+    print("  list                 filter by name (substring or wildcard)")
+    print("  model                         switch model interactively")
+    print("  backend                       show current backend")
+    print("  backend:bedrock               switch to AWS Bedrock")
+    print("  backend:ollama                switch to local Ollama")
+    print("  history                       show conversation history")
+    print("  clear                         clear conversation history")
+    print("  webon / weboff                toggle web search globally")
+    print("  quit                          exit")
     print()
 
     while True:
@@ -1672,7 +1672,10 @@ if __name__ == "__main__":
 
         # -- list ----------------------------------------------------------
         if cmd.startswith("list"):
-            pattern = raw[4:].strip() or None
+            pattern = raw[4:].strip()
+            if pattern.startswith(":"):
+                pattern = pattern[1:].strip()
+            pattern = pattern or None
             list_papers(collection, pattern)
             continue
 
