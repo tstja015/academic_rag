@@ -16,6 +16,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 import config
+from onedrive_utils import free_onedrive_file
 
 log = logging.getLogger(__name__)
 
@@ -252,7 +253,7 @@ def fetch_metadata_for_file(pdf_path: str, file_hash: str,
 
 
 # ---------------------------------------------------------------------------
-# Bulk metadata fetch (called from ingest or standalone)
+# Bulk metadata fetch (called standalone or from query.py fetchmeta command)
 # ---------------------------------------------------------------------------
 
 def fetch_all_metadata(progress: dict = None, force: bool = False):
@@ -260,8 +261,9 @@ def fetch_all_metadata(progress: dict = None, force: bool = False):
     Fetch metadata for all ingested papers.
 
     Uses the ingest progress file to find file hashes and paths.
+    Frees OneDrive files after reading each PDF (standalone-safe).
     """
-    from ingest import load_progress, collect_pdfs, file_hash as compute_hash
+    from ingest import load_progress
 
     if progress is None:
         progress = load_progress()
@@ -300,6 +302,9 @@ def fetch_all_metadata(progress: dict = None, force: bool = False):
             continue
 
         entry = fetch_metadata_for_file(abs_path, fhash, force=force)
+
+        # Free OneDrive file after reading (standalone mode safety)
+        free_onedrive_file(abs_path)
 
         if entry["fetch_status"] == "success":
             fetched += 1
