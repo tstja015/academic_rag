@@ -115,6 +115,7 @@ def set_backend(name: str) -> bool:
     config._BACKEND_OVERRIDE = name
 
     if name == "ollama":
+        _ensure_ollama_running()  # <-- add this line
         if not _check_ollama():
             print(C.LABEL +
                   "  Warning: Ollama not reachable at {}.  "
@@ -122,7 +123,6 @@ def set_backend(name: str) -> bool:
                   "('ollama serve').".format(_get_ollama_base_url()) +
                   C.RESET)
         else:
-            # Server is up -- also validate the model
             _validate_ollama_model()
 
     return True
@@ -394,19 +394,6 @@ def _get_ollama_models() -> list:
 def _invoke_ollama(messages:   list,
                    system:     str = None,
                    max_tokens: int = 4096) -> str | None:
-    """
-    POST to Ollama /api/chat.
-
-    Parameters
-    ----------
-    messages   : list of {"role": ..., "content": ...}
-    system     : optional system-prompt string
-    max_tokens : num_predict passed to Ollama options
-
-    Returns
-    -------
-    Assistant reply string, or None on error.
-    """
     try:
         import requests
     except ImportError:
@@ -414,14 +401,16 @@ def _invoke_ollama(messages:   list,
               "Run: pip install requests")
         return None
 
+    # Auto-start if not running
+    if not _check_ollama():
+        _ensure_ollama_running()
+
     if not _check_ollama():
         print(C.LABEL +
               "  Ollama not reachable at {}.  "
-              "Is Ollama running?  Try: ollama serve".format(
-                  _get_ollama_base_url()) +
+              "Could not auto-start.".format(_get_ollama_base_url()) +
               C.RESET)
         return None
-
     full_messages = []
     if system:
         full_messages.append({"role": "system", "content": system})
@@ -446,6 +435,52 @@ def _invoke_ollama(messages:   list,
         print("  Ollama invocation error: {}".format(exc))
         return None
 
+
+def _ensure_ollama_running() -> bool:
+    """
+    Start Ollama server automatically if it's not already running.
+    Returns True if Ollama is reachable after this call.
+    """
+    if not _get_backend() == "ollama":
+        return True
+
+    if _check_ollama():
+        return True
+
+    print(C.LABEL + "  Starting Ollama server..." + C.RESET)
+
+    try:
+        import subprocess
+        # Start ollama serve in the background
+        proc = subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detach from parent process
+        )
+
+        # Wait up to 15 seconds for it to become responsive
+        import time
+        for i in range(30):
+            time.sleep(0.5)
+            if _check_ollama():
+                print(C.DIM + "  Ollama started (PID {}).".format(proc.pid) + C.RESET)
+                return True
+
+        print(C.LABEL +
+              "  Warning: Ollama process started but not responding after 15s." +
+              C.RESET)
+        return False
+
+    except FileNotFoundError:
+        print(C.LABEL +
+              "  Error: 'ollama' command not found. "
+              "Install from https://ollama.com" + C.RESET)
+        return False
+    except Exception as exc:
+        print(C.LABEL +
+              "  Error starting Ollama: {}".format(exc) + C.RESET)
+        return False
 
 # ---------------------------------------------------------------------------
 # Unified LLM router
@@ -1596,18 +1631,15 @@ if __name__ == "__main__":
 
     # Check Ollama reachability and model availability at startup
     if _get_backend() == "ollama":
-        if not _check_ollama():
-            print(C.LABEL +
-                  "WARNING: Ollama not reachable at {}.  "
-                  "Queries will fail until Ollama is started "
-                  "('ollama serve').".format(_get_ollama_base_url()) +
-                  C.RESET)
-        else:
+        _ensure_ollama_running()
+        if _check_ollama():
             print("Ollama reachable at {}".format(_get_ollama_base_url()))
-            # Validate the model exists locally
             if _validate_ollama_model():
-                print("Ollama model '{}' is ready.".format(
-                    _get_ollama_model()))
+                print("Ollama model '{}' is ready.".format(_get_ollama_model()))
+        else:
+            print(C.LABEL +
+                  "WARNING: Could not start Ollama. "
+                  "Queries will fail until Ollama is running." + C.RESET)
 
 
     web_status = "on" if getattr(config, "WEB_SEARCH_ENABLED", False) else "off"
