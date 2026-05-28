@@ -43,6 +43,14 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 import config
 
+from metadata import (
+    load_metadata,
+    search_by_author,
+    search_by_filename,
+    get_all_authors,
+    fetch_all_metadata,
+)
+
 # ---------------------------------------------------------------------------
 # Readline support (arrow keys, history navigation, cursor editing)
 # ---------------------------------------------------------------------------
@@ -1621,6 +1629,118 @@ def parse_query(raw: str) -> tuple:
 
     return query.strip(), section_filter, folder_filter, force_web, None, None
 
+# ---------------------------------------------------------------------------
+# Author search
+# ---------------------------------------------------------------------------
+
+def cmd_author(pattern: str = None):
+    """List papers by author name."""
+    if not pattern:
+        # Show all authors with paper counts
+        author_map = get_all_authors()
+        if not author_map:
+            print("  No author metadata available.")
+            print('  Run: python -c "from metadata import fetch_all_metadata; fetch_all_metadata()"')
+            return
+
+        print("\n{} unique authors across {} papers:\n".format(
+            len(author_map),
+            len(set(f for files in author_map.values() for f in files)),
+        ))
+
+        # Sort by number of papers (descending)
+        sorted_authors = sorted(
+            author_map.items(),
+            key=lambda x: len(x[1]),
+            reverse=True,
+        )
+
+        for author, files in sorted_authors:
+            print("  {:<40} ({} paper{})".format(
+                author,
+                len(files),
+                "" if len(files) == 1 else "s",
+            ))
+
+        print()
+        return
+
+    # Search for specific author
+    results = search_by_author(pattern)
+
+    if not results:
+        print("  No papers found for author matching '{}'.".format(pattern))
+        print("  Run 'author' (no argument) to see all authors.")
+        return
+
+    print("\n{} paper(s) matching author '{}':\n".format(
+        len(results), pattern))
+
+    for entry in sorted(results, key=lambda x: x.get("year") or 0, reverse=True):
+        year = entry.get("year", "?")
+        fname = entry.get("filename", "?")
+        title = entry.get("title", "")
+        authors = ", ".join(entry.get("authors", [])[:3])
+        if len(entry.get("authors", [])) > 3:
+            authors += " et al."
+
+        print("  {:<55} {}  ({})".format(fname, year, authors))
+        if title and title != fname.replace(".pdf", "").replace("_", " "):
+            print("  {}Title: {}{}".format(C.DIM, title[:80], C.RESET))
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Paper info
+# ---------------------------------------------------------------------------
+
+def cmd_info(pattern: str = None):
+    """Show full metadata for a paper."""
+    if not pattern:
+        print("  Usage: info ")
+        return
+
+    results = search_by_filename(pattern)
+
+    if not results:
+        print("  No papers found matching '{}'.".format(pattern))
+        print("  Try 'list' to see indexed filenames.")
+        return
+
+    for entry in results:
+        print("\n" + "=" * 62)
+        print(C.BOLD + "  " + entry.get("filename", "?") + C.RESET)
+        print("=" * 62)
+
+        fields = [
+            ("Title",     entry.get("title", "")),
+            ("Authors",   ", ".join(entry.get("authors", []))),
+            ("Year",      entry.get("year", "")),
+            ("Journal",   entry.get("journal", "")),
+            ("DOI",       entry.get("doi", "")),
+            ("Volume",    entry.get("volume", "")),
+            ("Issue",     entry.get("issue", "")),
+            ("Pages",     entry.get("pages", "")),
+            ("Publisher", entry.get("publisher", "")),
+            ("Folder",    entry.get("folder", "")),
+            ("Path",      entry.get("full_path", "")),
+            ("Status",    entry.get("fetch_status", "")),
+        ]
+
+        for label, value in fields:
+            if value:
+                print("  {:<12}: {}".format(label, value))
+
+        abstract = entry.get("abstract", "")
+        if abstract:
+            print("  {:<12}: {}{}".format(
+                "Abstract",
+                abstract[:200],
+                "..." if len(abstract) > 200 else "",
+            ))
+
+        print()
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1678,6 +1798,10 @@ if __name__ == "__main__":
     print("Commands:")
     print("  list                          show all indexed papers")
     print("  list                 filter by name (substring or wildcard)")
+    print("  author                        list all authors with paper counts")
+    print("  author                  find papers by author name")
+    print("  info                show full metadata for a paper")
+    print("  fetchmeta                     fetch/refresh metadata for all papers")
     print("  model                         switch model interactively")
     print("  backend                       show current backend")
     print("  backend:bedrock               switch to AWS Bedrock")
@@ -1710,6 +1834,31 @@ if __name__ == "__main__":
                 pattern = pattern[1:].strip()
             pattern = pattern or None
             list_papers(collection, pattern)
+            continue
+    
+        # -- author --------------------------------------------------------
+        if cmd.startswith("author"):
+            pattern = raw[6:].strip()
+            if pattern.startswith(":"):
+                pattern = pattern[1:].strip()
+            pattern = pattern or None
+            cmd_author(pattern)
+            continue
+
+        # -- info ----------------------------------------------------------
+        if cmd.startswith("info"):
+            pattern = raw[4:].strip()
+            if pattern.startswith(":"):
+                pattern = pattern[1:].strip()
+            pattern = pattern or None
+            cmd_info(pattern)
+            continue
+
+        # -- fetchmeta -----------------------------------------------------
+        if cmd == "fetchmeta":
+            print("  Fetching metadata for all papers (this may take a while)...")
+            fetch_all_metadata()
+            print("  Done.")
             continue
 
         # -- history -------------------------------------------------------

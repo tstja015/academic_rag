@@ -39,6 +39,9 @@ from onedrive_utils import (
     cleanup_onedrive_logs,
 )
 
+from metadata import fetch_metadata_for_file
+
+
 # -- logging ----------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -378,6 +381,12 @@ def ingest_one(path: str, collection, embed_model, fhash: str):
                 for j in range(i, end)
             ],
         )
+
+    # -- Fetch metadata (DOI + CrossRef) -----------------------------------
+    try:
+        fetch_metadata_for_file(path, fhash)
+    except Exception as e:
+        log.debug("Metadata fetch failed for %s: %s", filename, e)
 
     # -- Section breakdown --------------------------------------------------
     section_counts = {}
