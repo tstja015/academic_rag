@@ -70,6 +70,7 @@ class C:
     LABEL  = "\033[93m"   # yellow
     DIM    = "\033[2m"    # grey
     BOLD   = "\033[1m"    # bold
+    GREEN  = "\033[92m"   # matrix green (bright green)
     RESET  = "\033[0m"
 
 
@@ -930,7 +931,7 @@ def ask_fulldoc(query:       str,
             corrected = _invoke(correction_prompt, max_tokens=8192)
             if corrected:
                 print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
-                print(C.ANSWER + corrected + C.RESET)
+                print(C.GREEN + corrected + C.RESET)
                 answer = corrected  # replace answer in history with corrected version
             else:
                 print(C.LABEL +
@@ -1309,7 +1310,7 @@ def ask(query:           str,
             corrected = _invoke(correction_prompt, max_tokens=8192)
             if corrected:
                 print(C.LABEL + "\n  [Corrected answer]" + C.RESET)
-                print(C.ANSWER + corrected + C.RESET)
+                print(C.GREEN + corrected + C.RESET)
                 answer = corrected
             else:
                 print(C.LABEL +
