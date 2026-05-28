@@ -382,3 +382,90 @@ def get_all_authors() -> dict:
             author_map[author].append(fname)
 
     return author_map
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(description="Fetch paper metadata via CrossRef")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-fetch all metadata even if already cached")
+    parser.add_argument("--dir", metavar="DIR", default=None,
+                        help="Only fetch metadata for PDFs under this directory")
+    args = parser.parse_args()
+
+    if args.dir:
+        import sys
+        from ingest import load_progress, file_hash as compute_hash
+
+        target_dir = os.path.abspath(args.dir)
+        if not os.path.isdir(target_dir):
+            log.error("--dir does not exist: %s", target_dir)
+            sys.exit(1)
+
+        progress = load_progress()
+        path_index = progress.get("path_index", {})
+        completed = set(progress.get("completed", []))
+
+        # Find PDFs in the target directory
+        pdfs = []
+        for root, _, files in os.walk(target_dir):
+            for fn in files:
+                if fn.lower().endswith(".pdf"):
+                    pdfs.append(os.path.join(root, fn))
+
+        if not pdfs:
+            log.error("No PDFs found under: %s", target_dir)
+            sys.exit(1)
+
+        log.info("Found %d PDFs under %s", len(pdfs), target_dir)
+
+        metadata = load_metadata()
+        fetched = 0
+        skipped = 0
+        no_doi = 0
+        failed = 0
+
+        from tqdm import tqdm
+        for pdf_path in tqdm(pdfs, desc="Fetching metadata"):
+            abs_path = os.path.abspath(pdf_path)
+
+            # Get hash from path_index or compute it
+            fhash = path_index.get(abs_path)
+            if not fhash:
+                try:
+                    fhash = compute_hash(pdf_path)
+                except OSError as e:
+                    log.warning("Cannot hash %s: %s", pdf_path, e)
+                    failed += 1
+                    continue
+
+            # Skip if already fetched (unless forcing)
+            if not args.force and fhash in metadata:
+                status = metadata[fhash].get("fetch_status", "")
+                if status in ("success", "no_doi"):
+                    skipped += 1
+                    continue
+
+            entry = fetch_metadata_for_file(abs_path, fhash, force=args.force)
+            free_onedrive_file(abs_path)
+
+            if entry["fetch_status"] == "success":
+                fetched += 1
+            elif entry["fetch_status"] == "no_doi":
+                no_doi += 1
+            else:
+                failed += 1
+
+        log.info(
+            "Metadata fetch complete: fetched=%d  no_doi=%d  failed=%d  skipped=%d",
+            fetched, no_doi, failed, skipped,
+        )
+
+    else:
+        fetch_all_metadata(force=args.force)
