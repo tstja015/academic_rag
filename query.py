@@ -284,9 +284,14 @@ def load_resources():
     collection = client.get_collection(config.COLLECTION_NAME)
 
     print("ChromaDB chunks loaded   : {}".format(collection.count()))
-    print("Ready.\n")
-    return embedder, reranker, collection
 
+    # Load paper metadata
+    from metadata import load_metadata
+    paper_metadata = load_metadata()
+    print("Paper metadata loaded    : {} papers".format(len(paper_metadata)))
+
+    print("Ready.\n")
+    return embedder, reranker, collection, paper_metadata
 
 # ---------------------------------------------------------------------------
 # Bedrock client (lazy, cached)
@@ -1633,14 +1638,21 @@ def parse_query(raw: str) -> tuple:
 # Author search
 # ---------------------------------------------------------------------------
 
-def cmd_author(pattern: str = None):
+def cmd_author(pattern: str, paper_metadata: dict):
     """List papers by author name."""
     if not pattern:
         # Show all authors with paper counts
-        author_map = get_all_authors()
+        author_map = {}
+        for fhash, entry in paper_metadata.items():
+            fname = entry.get("filename", "")
+            for author in entry.get("authors", []):
+                if author not in author_map:
+                    author_map[author] = []
+                author_map[author].append(fname)
+
         if not author_map:
             print("  No author metadata available.")
-            print('  Run: python -c "from metadata import fetch_all_metadata; fetch_all_metadata()"')
+            print("  Run 'fetchmeta' to populate metadata.")
             return
 
         print("\n{} unique authors across {} papers:\n".format(
@@ -1666,7 +1678,15 @@ def cmd_author(pattern: str = None):
         return
 
     # Search for specific author
-    results = search_by_author(pattern)
+    name_lower = pattern.lower()
+    results = []
+
+    for fhash, entry in paper_metadata.items():
+        authors = entry.get("authors", [])
+        for author in authors:
+            if name_lower in author.lower():
+                results.append(entry)
+                break
 
     if not results:
         print("  No papers found for author matching '{}'.".format(pattern))
@@ -1695,17 +1715,28 @@ def cmd_author(pattern: str = None):
 # Paper info
 # ---------------------------------------------------------------------------
 
-def cmd_info(pattern: str = None):
+def cmd_info(pattern: str, paper_metadata: dict):
     """Show full metadata for a paper."""
     if not pattern:
-        print("  Usage: info ")
+        print("  Usage: info <filename>")
         return
 
-    results = search_by_filename(pattern)
+    import fnmatch
+    pattern_lower = pattern.lower()
+    results = []
+
+    for fhash, entry in paper_metadata.items():
+        fname = entry.get("filename", "")
+        if "*" in pattern or "?" in pattern:
+            if fnmatch.fnmatch(fname.lower(), pattern_lower):
+                results.append(entry)
+        else:
+            if pattern_lower in fname.lower():
+                results.append(entry)
 
     if not results:
         print("  No papers found matching '{}'.".format(pattern))
-        print("  Try 'list' to see indexed filenames.")
+        print("  Run 'fetchmeta' to populate metadata, or 'list' to check filenames.")
         return
 
     for entry in results:
@@ -1747,7 +1778,7 @@ def cmd_info(pattern: str = None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    embedder, reranker, collection = load_resources()
+    embedder, reranker, collection, paper_metadata = load_resources()
     history = ConversationHistory()   # reads MAX_TURNS / MAX_ANSWER_CHARS from config
 
     # Check Ollama reachability and model availability at startup
@@ -1842,7 +1873,7 @@ if __name__ == "__main__":
             if pattern.startswith(":"):
                 pattern = pattern[1:].strip()
             pattern = pattern or None
-            cmd_author(pattern)
+            cmd_author(pattern, paper_metadata)
             continue
 
         # -- info ----------------------------------------------------------
@@ -1851,16 +1882,20 @@ if __name__ == "__main__":
             if pattern.startswith(":"):
                 pattern = pattern[1:].strip()
             pattern = pattern or None
-            cmd_info(pattern)
+            cmd_info(pattern, paper_metadata)
             continue
 
         # -- fetchmeta -----------------------------------------------------
         if cmd == "fetchmeta":
             print("  Fetching metadata for all papers (this may take a while)...")
+            from metadata import fetch_all_metadata
             fetch_all_metadata()
-            print("  Done.")
+            # Reload after fetch
+            from metadata import load_metadata
+            paper_metadata = load_metadata()
+            print("  Done. Loaded {} papers.".format(len(paper_metadata)))
             continue
-
+        
         # -- history -------------------------------------------------------
         if cmd == "history":
             block = history.format_for_prompt()
